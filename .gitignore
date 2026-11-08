@@ -1,0 +1,6 @@
+firefox-live/
+firefox-live-ready
+*.log
+*.xpi
+.env
+.env.*
