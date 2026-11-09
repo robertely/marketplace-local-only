@@ -1,6 +1,12 @@
 # Marketplace Local Only
 
-A Violentmonkey userscript for Facebook Marketplace. See estimated distance beside the price and filter listings by shipping, distance, and Poshmark.
+A Violentmonkey userscript for TheFaceBook Marketplace. The location and/or shipping filters in marketplace are more of a suggestion then a rule. This userscript will warn you about items outside your search radius and optionally hide them entirely. Not so much a complete overhaul as "just make it work the way it says it does."
+
+I've allowed TheFaceBook a little grace here by showing visible distance warnings. I think a little fuzzy matching here is OK, but it will hide posts more than 5x the search radius because if my filter is 10 miles I'm probably not driving 868.1 miles.
+
+<img width="2297" height="1182" alt="A screenshot of facebook marketplace with textual warnings about listings that exceed the filter distance." src="https://github.com/user-attachments/assets/64499357-f438-4db5-a685-83a9d795db50" />
+
+Also hides Poshmark, and postings that will ship to you by default. This is not an "ad-blocker", but one *_could hypothetically_* pair it with something like [uBlock Origin.](https://addons.mozilla.org/en-US/firefox/addon/ublock-origin/) which is also not an "ad blocker", but might make your browsing experience safer, and faster.
 
 ## Install in Firefox
 
@@ -22,7 +28,7 @@ The multipliers follow your current Marketplace radius. With a 10 mi radius, the
 
 The script reads listing labels and provider information available on Marketplace pages. It estimates straight-line distance from your Marketplace search center to the representative point of a recognized city. The lookup covers places in the 50 states, the District of Columbia, and Puerto Rico.
 
-Designed for desktop Marketplace in English. Unrecognized cities keep Facebook's own location text. Shipping and Poshmark detection depend on the labels and provider information Facebook makes available.
+Designed for desktop Marketplace in English. Unrecognized cities keep 's own location text. Shipping and Poshmark detection depend on the labels and provider information  makes available.
 
 The lookup and filtering run locally in your browser. Violentmonkey stores your settings in your browser profile.
 
