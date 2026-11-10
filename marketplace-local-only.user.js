@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Facebook Marketplace Local Only
 // @namespace    marketplace-local-only
-// @version      0.8.6
-// @description  Color Marketplace distances and hide listings using configurable radius, shipping, and Poshmark rules.
+// @version      0.8.7
+// @description  Color Marketplace distances and hide listings using configurable radius, shipping, and partner-listing rules.
 // @license      MIT
 // @homepageURL  https://github.com/robertely/marketplace-local-only
 // @supportURL   https://github.com/robertely/marketplace-local-only/issues
@@ -63,7 +63,7 @@ SOFTWARE.
   const EMPTY_PACKING_DIV = 'div:empty:not([class], [style], [id], [role], [aria-label], [tabindex])';
   const PACKING_SLOT = `${SIZED_TILE}:has(> div:only-child):not(:has(${ITEM_LINK}))`;
   const ITEM_PATH = /^\/marketplace\/item\/(\d+)(?:\/|$)/;
-  const POSHMARK_LABEL = /^(?:(?:from|listed on|sold on) )?poshmark$/i;
+  const PARTNER_LABEL = /^(?:(?:from|listed on|sold on) )?(?:poshmark|ebay)$/i;
   const SHIPPING_LABELS = new Set([
     'ships to you',
     'ship to you',
@@ -87,7 +87,7 @@ SOFTWARE.
     bands: [{ cutoff: 1, color: 'yellow' }, { cutoff: 2, color: 'red' }],
     hideBeyond: 5,
     hideShipping: true,
-    hidePoshmark: true,
+    hidePartners: true,
     showAllDistances: false,
   };
   const STATE_NAMES = {
@@ -111,8 +111,8 @@ SOFTWARE.
   const SIDEBAR_LOCATION = '[role="button"][aria-label^="Location:"], button[aria-label^="Location:"]';
   const LOCATION_DIALOG = '[role="dialog"][aria-label="Change location"]';
   const checkedRouteScripts = new WeakMap();
-  const checkedPartnerScripts = new WeakSet();
-  const poshmarkIds = new Set();
+  const checkedPartnerScripts = new WeakMap();
+  const partnerIds = new Set();
   const packedFeeds = new Set();
   const packingTargets = new Set();
   let hiddenTiles = new Set();
@@ -128,7 +128,7 @@ SOFTWARE.
   let settings = readSettings(GM_getValue(SETTINGS_KEY));
   let settingsCommand;
   let settingsDialog;
-  let poshmarkNotice;
+  let partnerNotice;
 
   function isMarketplaceFeed() {
     return MARKETPLACE_PATH.test(location.pathname)
@@ -156,12 +156,14 @@ SOFTWARE.
   }
 
   function readSettings(value) {
-    const { bands, hideBeyond, hideShipping, hidePoshmark, showAllDistances } = settingsError(value) ? DEFAULT_SETTINGS : value;
+    const { bands, hideBeyond, hideShipping, hidePartners, hidePoshmark, showAllDistances } = settingsError(value) ? DEFAULT_SETTINGS : value;
     return {
       bands: bands.toSorted((a, b) => a.cutoff - b.cutoff),
       hideBeyond,
       hideShipping,
-      hidePoshmark: typeof hidePoshmark === 'boolean' ? hidePoshmark : DEFAULT_SETTINGS.hidePoshmark,
+      // Carry over the previous Poshmark switch when upgrading saved settings.
+      hidePartners: typeof hidePartners === 'boolean' ? hidePartners
+        : typeof hidePoshmark === 'boolean' ? hidePoshmark : DEFAULT_SETTINGS.hidePartners,
       showAllDistances: showAllDistances === true,
     };
   }
@@ -236,7 +238,8 @@ SOFTWARE.
           <fieldset>
             <legend>Hide listings</legend>
             <label class="hide-option"><input type="checkbox" id="hide-shipping"> Hide listings labeled for shipping</label>
-            <label class="hide-option"><input type="checkbox" id="hide-poshmark"> Hide Poshmark listings</label>
+            <label class="hide-option"><input type="checkbox" id="hide-partners" aria-describedby="partner-help"> Hide partner listings</label>
+            <p id="partner-help" class="hint">Includes eBay, Poshmark, and other Marketplace partners.</p>
             <div class="hide-cutoff">
               <label><input type="checkbox" id="hide-distance"> Hide beyond</label>
               <label><input type="number" id="hide-cutoff" step="0.1" aria-label="Hide cutoff in multiples of your radius"> × radius</label>
@@ -257,7 +260,7 @@ SOFTWARE.
     const add = root.querySelector('#add-band');
     const showAllDistances = root.querySelector('#show-all-distances');
     const hideShipping = root.querySelector('#hide-shipping');
-    const hidePoshmark = root.querySelector('#hide-poshmark');
+    const hidePartners = root.querySelector('#hide-partners');
     const hideDistance = root.querySelector('#hide-distance');
     const hideCutoff = root.querySelector('#hide-cutoff');
     const error = root.querySelector('#error');
@@ -312,7 +315,7 @@ SOFTWARE.
       bands.replaceChildren(...value.bands.map(makeBand));
       showAllDistances.checked = value.showAllDistances;
       hideShipping.checked = value.hideShipping;
-      hidePoshmark.checked = value.hidePoshmark;
+      hidePartners.checked = value.hidePartners;
       hideDistance.checked = value.hideBeyond !== null;
       hideCutoff.value = value.hideBeyond ?? DEFAULT_SETTINGS.hideBeyond;
       alignCutoffStep(hideCutoff);
@@ -345,7 +348,7 @@ SOFTWARE.
           };
         }),
         hideShipping: hideShipping.checked,
-        hidePoshmark: hidePoshmark.checked,
+        hidePartners: hidePartners.checked,
         hideBeyond: hideDistance.checked ? hideCutoff.valueAsNumber : null,
         showAllDistances: showAllDistances.checked,
       };
@@ -523,69 +526,92 @@ SOFTWARE.
     return { ships, priceRow: rows[0], distanceKm: point ? distanceInKm(center, point) : null };
   }
 
-  function readPoshmarkIds() {
-    for (const script of document.querySelectorAll('script[type="application/json"][data-sjs]')) {
-      if (checkedPartnerScripts.has(script) || !script.textContent) continue;
-      const source = script.textContent;
-      if (!/"partner_(?:type|brand_name)"\s*:\s*"poshmark"/i.test(source)) {
-        checkedPartnerScripts.add(script);
-        continue;
-      }
-      let data;
-      try {
-        data = JSON.parse(source);
-      } catch {
-        continue;
-      }
-      checkedPartnerScripts.add(script);
-      const pending = [data];
-      while (pending.length) {
-        const value = pending.pop();
-        if (!value || typeof value !== 'object') continue;
-        if (typeof value.id === 'string' && /^\d+$/.test(value.id)
-          && (value.partner_type === 'POSHMARK' || value.partner_brand_name === 'Poshmark')) {
-          poshmarkIds.add(value.id);
+  function collectPartnerIds(source, ids) {
+    if (!/"(?:is_partner_listing|partner_type|partner_brand_name)"\s*:/.test(source)) return;
+    let data;
+    try {
+      data = JSON.parse(source);
+    } catch {
+      return;
+    }
+    const pending = [data];
+    while (pending.length) {
+      const value = pending.pop();
+      if (!value || typeof value !== 'object') continue;
+      if (typeof value.id === 'string' && /^\d+$/.test(value.id)) {
+        const provider = typeof value.partner_type === 'string' ? value.partner_type : '';
+        const brand = typeof value.partner_brand_name === 'string' ? value.partner_brand_name : '';
+        if (value.is_partner_listing === true || /^(?:poshmark|ebay)$/i.test(provider)
+          || /^(?:poshmark|ebay)$/i.test(brand)) {
+          ids.add(value.id);
+        } else if (value.is_partner_listing === false) {
+          ids.delete(value.id);
         }
-        for (const child of Object.values(value)) {
-          if (child && typeof child === 'object') pending.push(child);
-        }
+      }
+      for (const child of Object.values(value)) {
+        if (child && typeof child === 'object') pending.push(child);
       }
     }
   }
 
-  function isPoshmarkCard(link) {
-    const id = ITEM_PATH.exec(link.pathname)?.[1];
-    if (poshmarkIds.has(id)) return true;
-    if (link.querySelector('img[alt="Poshmark" i], [role="img"][aria-label="Poshmark" i]')) return true;
-    if (/,\s*(?:(?:from|listed on|sold on) )?poshmark,\s*listing \d+$/i.test(link.getAttribute('aria-label') ?? '')) return true;
-    const rows = link.firstElementChild?.lastElementChild?.children ?? [];
-    return Array.from(rows).slice(2).some(row => POSHMARK_LABEL.test(row.textContent.trim()));
+  function readPartnerIds() {
+    for (const script of document.querySelectorAll('script[type="application/json"][data-sjs]')) {
+      const source = script.textContent;
+      if (checkedPartnerScripts.get(script) === source) continue;
+      checkedPartnerScripts.set(script, source);
+      collectPartnerIds(source, partnerIds);
+    }
   }
 
-  function isPoshmarkCheckout(link) {
+  function hasPartnerBadge(link) {
+    const body = link.firstElementChild;
+    if (!body || body.childElementCount < 2) return false;
+    // Facebook's generic partner label is in the photo, separate from the title.
+    const photo = body.firstElementChild;
+    return [photo, ...photo.querySelectorAll('div, span, [aria-label], [title]')].some(element =>
+      element.getAttribute('aria-label')?.trim() === 'Partner listing'
+      || element.getAttribute('title')?.trim() === 'Partner listing'
+      || (element.childElementCount === 0 && element.textContent.trim() === 'Partner listing'));
+  }
+
+  function isPartnerCard(link) {
+    const id = ITEM_PATH.exec(link.pathname)?.[1];
+    if (partnerIds.has(id) || hasPartnerBadge(link)) return true;
+    if (link.querySelector('img[alt="Poshmark" i], img[alt="eBay" i], [role="img"][aria-label="Poshmark" i], [role="img"][aria-label="eBay" i]')) return true;
+    if (/,\s*(?:(?:from|listed on|sold on) )?(?:poshmark|ebay),\s*listing \d+$/i.test(link.getAttribute('aria-label') ?? '')) return true;
+    const rows = link.firstElementChild?.lastElementChild?.children ?? [];
+    return Array.from(rows).slice(2).some(row => PARTNER_LABEL.test(row.textContent.trim()));
+  }
+
+  function isPartnerCheckout(link, verifiedPartner) {
     const label = (link.getAttribute('aria-label') ?? link.textContent).trim();
-    if (!/^(?:see item|buy now) on poshmark$/i.test(label)) return false;
+    const match = /^(?:see item|buy now) on (.+)$/i.exec(label);
+    if (!match) return false;
     if (!URL.canParse(link.href)) return false;
     const url = new URL(link.href);
     const destination = url.hostname === 'l.facebook.com' && url.pathname === '/l.php'
       ? url.searchParams.get('u') : link.href;
     if (!URL.canParse(destination)) return false;
-    const { hostname } = new URL(destination);
-    return hostname === 'poshmark.com' || hostname.endsWith('.poshmark.com');
+    const { hostname, protocol } = new URL(destination);
+    if (!['https:', 'http:'].includes(protocol) || /(^|\.)facebook\.com$/i.test(hostname)) return false;
+    return verifiedPartner || (/^(?:poshmark|ebay)$/i.test(match[1])
+      && /(^|\.)(?:poshmark|ebay)\.com$/i.test(hostname));
   }
 
-  function findPoshmarkItem() {
+  function findPartnerItem(itemId) {
     const title = document.querySelector('h1');
     if (!title) return null;
-    const checkouts = [...document.querySelectorAll('a[href]')].filter(isPoshmarkCheckout);
+    const checkouts = [...document.querySelectorAll('a[href]')].filter(link => isPartnerCheckout(link, partnerIds.has(itemId)));
     if (!checkouts.length) return null;
     let details = null;
     for (let panel = title.parentElement; panel && panel !== document.body; panel = panel.parentElement) {
       if (panel.querySelector(ITEM_LINK)) break;
-      if (!checkouts.every(link => panel.contains(link))) continue;
-      details ??= panel;
+      const hasCheckout = checkouts.some(link => panel.contains(link));
+      if (hasCheckout) details ??= panel;
+      // Stop at the item's photo and title so a sibling recommendation's
+      // checkout cannot make the whole page look like a partner listing.
       if (panel.querySelector('img[alt^="Product photo of "]')) {
-        details = panel;
+        if (hasCheckout) details = panel;
         break;
       }
     }
@@ -595,19 +621,19 @@ SOFTWARE.
     return details;
   }
 
-  function updatePoshmarkNotice(panel) {
+  function updatePartnerNotice(panel) {
     if (!panel) {
-      poshmarkNotice?.remove();
-      poshmarkNotice = undefined;
+      partnerNotice?.remove();
+      partnerNotice = undefined;
       return;
     }
-    if (!poshmarkNotice) {
-      poshmarkNotice = document.createElement('p');
-      poshmarkNotice.setAttribute('role', 'status');
-      poshmarkNotice.textContent = 'Poshmark listing hidden. You can show it in Marketplace Local Only settings.';
-      poshmarkNotice.style.padding = '1rem';
+    if (!partnerNotice) {
+      partnerNotice = document.createElement('p');
+      partnerNotice.setAttribute('role', 'status');
+      partnerNotice.textContent = 'Partner listing hidden. You can show it in Marketplace Local Only settings.';
+      partnerNotice.style.padding = '1rem';
     }
-    if (poshmarkNotice.nextElementSibling !== panel) panel.before(poshmarkNotice);
+    if (partnerNotice.nextElementSibling !== panel) panel.before(partnerNotice);
   }
 
   function findListingTile(link) {
@@ -788,13 +814,13 @@ SOFTWARE.
     const itemId = ITEM_PATH.exec(location.pathname)?.[1];
     syncSettingsMenu(inFeed || Boolean(itemId));
 
-    const filterPoshmark = settings.hidePoshmark && (inFeed || Boolean(itemId));
-    if (filterPoshmark) readPoshmarkIds();
-    const poshmarkItem = filterPoshmark && itemId ? findPoshmarkItem() : null;
-    updatePoshmarkNotice(poshmarkItem);
-    if (poshmarkItem) tilesToHide.add(poshmarkItem);
+    const filterPartners = settings.hidePartners && (inFeed || Boolean(itemId));
+    if (filterPartners) readPartnerIds();
+    const partnerItem = filterPartners && itemId ? findPartnerItem(itemId) : null;
+    updatePartnerNotice(partnerItem);
+    if (partnerItem) tilesToHide.add(partnerItem);
 
-    if (inFeed || filterPoshmark) {
+    if (inFeed || filterPartners) {
       const marketplaceArea = inFeed ? readMarketplaceArea() : {};
       if (marketplaceArea.radiusKm && !placesLoading) {
         placesLoading = true;
@@ -805,7 +831,7 @@ SOFTWARE.
         : null;
 
       for (const link of document.querySelectorAll(ITEM_LINK)) {
-        if (filterPoshmark && isPoshmarkCard(link)) {
+        if (filterPartners && isPartnerCard(link)) {
           tilesToHide.add(findListingTile(link));
           continue;
         }
@@ -5526,7 +5552,7 @@ Yx5f6ev0xNVvfFtJBMz/z//3/wNn0a04KZ4QAA==
     subtree: true,
     childList: true,
     characterData: true,
-    attributeFilter: ['href', 'aria-label', 'alt'],
+    attributeFilter: ['href', 'aria-label', 'alt', 'title'],
   });
   new MutationObserver(records => {
     if (records.some(({ target }) => target === document.documentElement || packingTargets.has(target))) scheduleScan();

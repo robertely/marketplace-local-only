@@ -186,6 +186,15 @@ function fixture() {
     </main></body></html>`;
 }
 
+function partnerTileFixture(id, badge = '') {
+  return `<div id="partner-${id}" style="min-width: 242px; max-width: 381px; display: flex">
+    <a href="/marketplace/item/${id}/?ref=search"><div><div><img alt="Tripod"><span aria-hidden="true">↗</span>
+      <span style="position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%)">${badge}</span></div>
+      <div><div class="price">$85</div><div>Partner listing</div><div class="city">Unknown region</div></div>
+    </div></a>
+  </div>`;
+}
+
 function poshmarkItemFixture() {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Partner listing fixture</title></head>
     <body><main>
@@ -197,7 +206,10 @@ function poshmarkItemFixture() {
           <a href="https://poshmark.com/listing/test">Buy now on Poshmark</a>
         </div>
       </section>
-      <section id="recommendations"><a href="/marketplace/item/1/">Local recommendation</a></section>
+      <section id="recommendations">
+        <a href="/marketplace/item/1/">Local recommendation</a>
+        <a href="https://www.ebay.com/itm/test">Buy now on eBay</a>
+      </section>
     </main></body></html>`;
 }
 
@@ -483,16 +495,17 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
       ]),
       hideBeyond: field('#hide-distance').checked ? field('#hide-cutoff').valueAsNumber : null,
       hideShipping: field('#hide-shipping').checked,
-      hidePoshmark: field('#hide-poshmark').checked,
+      hidePartners: field('#hide-partners').checked,
       showAllDistances: field('#show-all-distances').checked,
     });
   `));
   const defaults = {
-    bands: [[1, 'yellow'], [2, 'red']], hideBeyond: 5, hideShipping: true, hidePoshmark: true, showAllDistances: false,
+    bands: [[1, 'yellow'], [2, 'red']], hideBeyond: 5, hideShipping: true, hidePartners: true, showAllDistances: false,
   };
   await open();
   assert.deepEqual(await readForm(), defaults);
   assert.equal(await form(`return field('#show-all-distances').labels[0].textContent.trim();`), 'Show distance within my radius');
+  assert.equal(await form(`return field('#hide-partners').labels[0].textContent.trim();`), 'Hide partner listings');
   const steps = await form(`
     function stepFrom(input, value) {
       input.value = value;
@@ -565,7 +578,7 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
     bands: [defaults.bands[0], [1.25, '#3669c7'], defaults.bands[1]],
     hideBeyond: null,
     hideShipping: false,
-    hidePoshmark: true,
+    hidePartners: true,
     showAllDistances: true,
   };
   assert.deepEqual(await readForm(), customized);
@@ -583,6 +596,8 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
   await verifyCards('Turning off nearby distances should remove their badges and apply the shipping switch.', miles);
   await verifyCards('The shipping switch should also update the second tab.', miles, ['shipped'], readPeer);
 
+  const photoCards = partnerTileFixture('90', 'Partner listing') + partnerTileFixture('91');
+  const labeledPartners = ['poshmark-label', 'ebay-label', 'partner-90'];
   await run(`
     (() => {
       const feed = document.querySelector('#feed');
@@ -591,6 +606,8 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
         ['poshmark-data', 82, 'Tripod', 'Location unavailable'],
         ['ordinary-partner', 83, 'Camera bag', 'Location unavailable'],
         ['ordinary-title', 84, 'Poshmark tote bag', 'Location unavailable'],
+        ['ebay-label', 85, 'Telephoto lens', 'Sold on eBay'],
+        ['other-partner-data', 86, 'Camera flash', 'Location unavailable'],
       ]) {
         const tile = document.querySelector('#unknown').cloneNode(true);
         tile.id = id;
@@ -600,32 +617,51 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
         row.textContent = label;
         feed.append(tile);
       }
+      feed.insertAdjacentHTML('beforeend', ${JSON.stringify(photoCards)});
     })()
   `);
-  await verifyCards('Poshmark hiding should start enabled.', miles, ['shipped', 'poshmark-label']);
+  await verifyCards('Partner filtering should hide cards with a provider label or a partner photo badge by default.',
+    miles, ['shipped', ...labeledPartners]);
   await open();
   await form(`field('#hide-shipping').click(); field('#save').click();`);
   await closed();
-  await verifyCards('A Poshmark provider label should hide only that card.', withShipping, ['poshmark-label']);
-  await run(`
-    (() => {
+  await verifyCards('Turning off shipping filtering should leave partner filtering enabled.', withShipping, labeledPartners);
+  await browser.send('browsingContext.activate', { context });
+  await evaluate(browser, context, `
+    (async () => {
       const data = document.createElement('script');
+      data.id = 'partner-data-fixture';
       data.type = 'application/json';
       data.setAttribute('data-sjs', '');
+      data.textContent = '{"listings":';
+      document.head.append(data);
+      // Let the script scan the incomplete data before finishing the same node.
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       data.textContent = JSON.stringify({ listings: [
         { id: '82', partner_type: 'POSHMARK' },
-        { id: '83', partner_type: 'OTHER_PARTNER' },
+        { id: '83', is_partner_listing: false, partner_type: 'OTHER_PARTNER' },
+        { id: '86', is_partner_listing: true, partner_type: 'OTHER_PARTNER' },
       ] });
-      document.head.append(data);
+    })()
+  `, true);
+  await verifyCards('Completing provider data in the same script should hide only the matching partner cards.',
+    withShipping, ['poshmark-label', 'poshmark-data', 'ebay-label', 'other-partner-data', 'partner-90']);
+  await run(`
+    (() => {
+      const data = document.querySelector('#partner-data-fixture');
+      const listings = JSON.parse(data.textContent);
+      listings.listings.find(listing => listing.id === '86').is_partner_listing = false;
+      data.textContent = JSON.stringify(listings);
     })()
   `);
-  await verifyCards('New provider data should hide the matching Poshmark card.', withShipping, ['poshmark-label', 'poshmark-data']);
+  await verifyCards('Corrected provider data should restore the matching ordinary card.',
+    withShipping, ['poshmark-label', 'poshmark-data', 'ebay-label', 'partner-90']);
 
   await browser.send('browsingContext.navigate', { context: peer, url: `${origin}/marketplace/item/81/?ref=search`, wait: 'complete' });
   await waitFor('The direct Poshmark item should be hidden while its recommendations stay visible.', () => readPeer(`
     getComputedStyle(document.querySelector('#partner-item')).display === 'none'
-    && document.querySelector('[role="status"]').textContent.startsWith('Poshmark listing hidden')
-    && document.querySelector('#recommendations').getClientRects().length > 0
+    && document.querySelector('[role="status"]').textContent.startsWith('Partner listing hidden')
+    && [...document.querySelectorAll('#recommendations a')].every(link => link.getClientRects().length > 0)
   `));
   await browser.send('browsingContext.activate', { context: peer });
   await evaluate(browser, peer, `
@@ -650,19 +686,45 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
     getComputedStyle(document.querySelector('#partner-item')).display === 'none'
   `));
   console.log('PASS a stale Poshmark panel cannot poison the next listing ID.');
+  await readPeer(`
+    for (const link of document.querySelectorAll('#partner-item a, #recommendations a[href^="/marketplace/item/"]')) link.remove();
+  `);
+  await waitFor('A checkout in the recommendations must not hide the ordinary item or its recommendations.', () => readPeer(`
+    document.querySelector('#partner-item').getClientRects().length > 0
+    && document.querySelector('#recommendations a[href^="https://www.ebay.com/"]').getClientRects().length > 0
+    && !document.querySelector('[role="status"]')
+  `));
+  await browser.send('browsingContext.reload', { context: peer, wait: 'complete' });
+  await waitFor('Reloading the partner item should restore its checkout and filtering.', () => readPeer(`
+    getComputedStyle(document.querySelector('#partner-item')).display === 'none'
+  `));
+  console.log('PASS a recommendation checkout does not hide the ordinary item beside it.');
   await open();
-  assert.equal((await readForm()).hidePoshmark, true);
-  await form(`field('#hide-poshmark').click(); field('#hide-shipping').click(); field('#save').click();`);
+  assert.equal((await readForm()).hidePartners, true);
+  await form(`field('#hide-partners').click(); field('#hide-shipping').click(); field('#save').click();`);
   await closed();
-  await verifyCards('Disabling the Poshmark switch should restore its cards.', miles);
+  await verifyCards('Disabling the partner switch should restore all its cards.', miles);
   await waitFor('Disabling the switch should restore the open item detail in the other tab.', () => readPeer(`
     document.querySelector('#partner-item').getClientRects().length > 0 && !document.querySelector('[role="status"]')
   `));
+  await browser.send('browsingContext.reload', { context, wait: 'complete' });
+  await browser.send('browsingContext.activate', { context });
+  await open();
+  assert.equal((await readForm()).hidePartners, false, 'Partner filtering should stay off after refresh.');
+  await form(`field('#cancel').click();`);
+  await closed();
+  await evaluate(browser, context, `
+    (async () => {
+      document.querySelector('#feed').insertAdjacentHTML('beforeend', ${JSON.stringify(photoCards)});
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    })()
+  `, true);
+  assert.equal(await run(`document.querySelector('#partner-90').getClientRects().length > 0`), true);
   await browser.send('browsingContext.close', { context: peer });
   await browser.send('browsingContext.close', { context: options });
   console.log('PASS nearby distances default to off, match the native price color, and persist when enabled.');
   console.log('PASS the Violentmonkey menu, custom bands, validation, Cancel and Escape, persistence, and cross-tab updates.');
-  console.log('PASS the Poshmark switch filters provider cards and the direct item while ordinary shipping and other sellers remain available.');
+  console.log('PASS partner filtering hides marked cards and the direct item, preserves ordinary listings, and stays off after refresh.');
 }
 
 async function checkHidingOwnership(run) {
@@ -854,18 +916,21 @@ async function testFirefox(seedLive) {
   const source = await readFile(`/test/${USER_SCRIPT}`, 'utf8');
   let code = localInstallCode(source, seedLive);
   let scriptRequests = 0;
+  const unexpectedItemRequests = [];
   const server = createServer((request, response) => {
+    const path = request.url.split('?')[0];
     if (request.url === `/${USER_SCRIPT}`) {
       scriptRequests++;
       response.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
       response.end(code);
-    } else if (request.url.split('?')[0] === '/marketplace/' || request.url.split('?')[0] === '/marketplace/item/81/') {
+    } else if (path === '/marketplace/' || path === '/marketplace/item/81/') {
       response.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
         'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline'",
       });
-      response.end(request.url.startsWith('/marketplace/item/') ? poshmarkItemFixture() : fixture());
+      response.end(path === '/marketplace/item/81/' ? poshmarkItemFixture() : fixture());
     } else {
+      if (path.startsWith('/marketplace/item/')) unexpectedItemRequests.push(path);
       response.writeHead(404).end();
     }
   });
@@ -917,6 +982,7 @@ async function testFirefox(seedLive) {
       assert.equal(update.after, update.before);
       console.log('PASS Violentmonkey skips the temporary install URL during an update check.');
       await checkFiltering(browser, origin, optionsUrl);
+      assert.deepEqual(unexpectedItemRequests, [], 'Partner filtering must not request listing detail pages.');
     }
   } finally {
     browser?.close();
