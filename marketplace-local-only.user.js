@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Facebook Marketplace Local Only
 // @namespace    marketplace-local-only
-// @version      0.8.7
+// @version      0.8.8
 // @description  Color Marketplace distances and hide listings using configurable radius, shipping, and partner-listing rules.
 // @license      MIT
 // @homepageURL  https://github.com/robertely/marketplace-local-only
@@ -130,9 +130,15 @@ SOFTWARE.
   let settingsDialog;
   let partnerNotice;
 
-  function isMarketplaceFeed() {
-    return MARKETPLACE_PATH.test(location.pathname)
-      && !/^\/marketplace\/(?:item|you|create|edit|inbox)(?:\/|$)/.test(location.pathname);
+  function isMarketplaceFeed(pathname = location.pathname) {
+    return MARKETPLACE_PATH.test(pathname)
+      && !/^\/marketplace\/(?:item|you|create|edit|inbox)(?:[/?#]|$)/.test(pathname);
+  }
+
+  function isItemRecommendation(link) {
+    // Today's picks identifies its source even while the previous feed stays mounted.
+    const params = new URL(link.href).searchParams;
+    return params.get('ref') === 'product_details' && params.get('referral_code') === 'marketplace_top_picks';
   }
 
   function settingsError(value) {
@@ -414,7 +420,7 @@ SOFTWARE.
     if (!data || typeof data !== 'object') return null;
 
     const route = data.initialRouteInfo?.route;
-    if (MARKETPLACE_PATH.test(route?.url ?? '')) {
+    if (isMarketplaceFeed(route?.url ?? '')) {
       const settings = route.rootView?.props?.location ?? route.hostableView?.props?.location;
       const { latitude, longitude, radius } = settings ?? {};
       if (Number.isFinite(latitude) && Math.abs(latitude) <= 90
@@ -450,7 +456,7 @@ SOFTWARE.
   }
 
   function captureAreaChange(event) {
-    if (!isMarketplaceFeed()) return;
+    if (!isMarketplaceFeed() && !ITEM_PATH.test(location.pathname)) return;
 
     const button = event.target.closest?.('[aria-label="Apply"]');
     const dialog = button?.closest(LOCATION_DIALOG);
@@ -466,11 +472,14 @@ SOFTWARE.
 
   function readMarketplaceArea() {
     area ??= {};
-    const routeArea = readNewRouteArea();
+    const inFeed = isMarketplaceFeed();
+    // Item-route coordinates can describe the seller. Use the search controls or
+    // the last feed area there, and leave unrelated route data for the next feed.
+    const routeArea = inFeed ? readNewRouteArea() : null;
     if (routeArea) Object.assign(area, routeArea);
 
     const sidebar = readSidebarArea();
-    if (sidebar) {
+    if (sidebar && (inFeed || sidebar.radiusKm)) {
       if (!routeArea && area.city && area.city !== sidebar.city) delete area.center;
       area.city = sidebar.city;
       area.radiusKm = sidebar.radiusKm ?? area.radiusKm;
@@ -820,8 +829,8 @@ SOFTWARE.
     updatePartnerNotice(partnerItem);
     if (partnerItem) tilesToHide.add(partnerItem);
 
-    if (inFeed || filterPartners) {
-      const marketplaceArea = inFeed ? readMarketplaceArea() : {};
+    if (inFeed || itemId) {
+      const marketplaceArea = readMarketplaceArea();
       if (marketplaceArea.radiusKm && !placesLoading) {
         placesLoading = true;
         loadPlaces().catch(error => console.warn('Marketplace Local Only could not load its city lookup.', error));
@@ -835,7 +844,7 @@ SOFTWARE.
           tilesToHide.add(findListingTile(link));
           continue;
         }
-        if (!inFeed) continue;
+        if (!inFeed && !isItemRecommendation(link)) continue;
         const listing = classifyListing(link, center);
         if (!listing) continue;
         const multiple = listing.distanceKm === null ? null : listing.distanceKm / marketplaceArea.radiusKm;

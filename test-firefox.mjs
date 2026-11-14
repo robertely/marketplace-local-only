@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 const ADDON_ID = '{aecec67f-0d10-4fa7-b7c7-609a2db280cf}';
 const USER_SCRIPT = 'marketplace-local-only.user.js';
 const FIREFOX = '/usr/lib/firefox/firefox';
+const LOCAL_ITEM_PATH = '/marketplace/item/92/';
 
 function findViolentmonkey() {
   const config = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
@@ -213,6 +214,41 @@ function poshmarkItemFixture() {
     </main></body></html>`;
 }
 
+function localItemFixture() {
+  const cards = [
+    ['pick-near', 'Camera', 'Broomfield, CO'],
+    ['pick-distant', 'Laptop', 'South Jordan, UT'],
+    ['pick-far', 'Radio', 'State College, PA'],
+    ['pick-shipped', 'Phone', 'Broomfield, CO', 'Ships to you'],
+    ['pick-partner', 'Tripod', 'Listed on Poshmark'],
+    ['pick-unknown', 'Bike', 'Location unavailable'],
+  ];
+  const route = {
+    url: LOCAL_ITEM_PATH,
+    rootView: { props: { location: { latitude: 40.7934, longitude: -77.86, radius: 25 } } },
+  };
+  return `<!doctype html><html lang="en" class="__fb-light-mode"><head><meta charset="utf-8"><title>Local listing fixture</title>
+    <script type="application/json" data-sjs>${JSON.stringify({ initialRouteInfo: { route } })}</script>
+    </head><body><main>
+      <section id="local-item">
+        <div><img alt="Product photo of Bookshelf"></div>
+        <div><h1>Bookshelf</h1><div class="price">$35</div>
+          <div aria-label="Seller location: State College, Pennsylvania">State College, Pennsylvania</div>
+        </div>
+      </section>
+      <section aria-labelledby="picks-heading">
+        <h2 id="picks-heading">Today's picks</h2>
+        <div id="picks" style="display: flex; flex-wrap: wrap">${cards.map(([id, title, label, shipping], index) => `
+          <div id="${id}" style="width: 242px; min-width: 242px; max-width: 381px; display: flex">
+            <a style="width: 100%" href="/marketplace/item/${101 + index}/?ref=product_details&amp;referral_code=marketplace_top_picks&amp;referral_story_type=top_picks"><div><div></div>
+              <div><div class="price">$50</div><div>${title}</div><div>${label}</div>${shipping ? `<div>${shipping}</div>` : ''}</div>
+            </div></a>
+          </div>`).join('')}
+        </div>
+      </section>
+    </main></body></html>`;
+}
+
 async function installScript(browser, origin) {
   const { context } = await browser.send('browsingContext.create', { type: 'tab' });
   try {
@@ -276,9 +312,10 @@ async function checkFiltering(browser, origin, optionsUrl) {
   const { context } = await browser.send('browsingContext.create', { type: 'tab' });
   await browser.send('browsingContext.navigate', { context, url: `${origin}/marketplace/`, wait: 'complete' });
   const run = expression => evaluate(browser, context, expression);
-  const verifyCards = (message, badges, hidden = ['shipped'], read = run) => waitFor(message, () => read(`
+  const verifyCards = (message, badges, hidden = ['shipped'], read = run, selector = '#feed > div') => waitFor(message, () => read(`
     (() => {
-      const cards = [...document.querySelectorAll('#feed > div')];
+      const cards = [...document.querySelectorAll(${JSON.stringify(selector)})];
+      if (!cards.length) return false;
       const hidden = cards.filter(card => getComputedStyle(card).display === 'none').map(card => card.id);
       const ordinaryRows = cards.filter(card => !card.querySelector('[data-vm-marketplace-distance]'));
       if (ordinaryRows.some(card => getComputedStyle(card.querySelector('.price')).display !== 'block')) return false;
@@ -502,6 +539,110 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
   const defaults = {
     bands: [[1, 'yellow'], [2, 'red']], hideBeyond: 5, hideShipping: true, hidePartners: true, showAllDistances: false,
   };
+
+  const itemUrl = `${origin}${LOCAL_ITEM_PATH}`;
+  const distantPick = { 'pick-distant': ['≈ 586.5 km', 'red'] };
+  const hiddenPicks = ['pick-far', 'pick-shipped', 'pick-partner'];
+  const verifyPicks = (message, badges, hidden) => verifyCards(message, badges, hidden, readPeer, '#picks > div');
+  const verifyLocalItem = async () => assert.equal(await readPeer(`
+    document.querySelector('#local-item').getClientRects().length > 0
+    && document.querySelector('#local-item .price').textContent === '$35'
+    && !document.querySelector('[role="status"]')
+  `), true, 'Filtering recommendations should preserve the open listing.');
+  await browser.send('browsingContext.navigate', { context: peer, url: itemUrl, wait: 'complete' });
+  await verifyPicks('A direct item visit should filter labeled recommendations without taking its seller location as the search center.',
+    {}, ['pick-shipped', 'pick-partner']);
+  await verifyLocalItem();
+
+  await open();
+  await form(`field('#hide-partners').click(); field('#show-all-distances').click(); field('#save').click();`);
+  await closed();
+  await verifyPicks('Direct recommendations should still filter shipping with partners off and show no distance without a search center.',
+    {}, ['pick-shipped']);
+  await open();
+  await form(`field('#restore').click(); field('#save').click();`);
+  await closed();
+  await readPeer(`
+    const sidebar = document.createElement('aside');
+    sidebar.innerHTML = '<button aria-label="Location: Arvada, Colorado, Within 130 km">Arvada, Colorado</button>';
+    document.querySelector('main').before(sidebar);
+  `);
+  await verifyPicks('A direct item visit should use the explicit Marketplace search sidebar.', distantPick, hiddenPicks);
+  await verifyLocalItem();
+  await readPeer(`document.querySelector('aside button').setAttribute('aria-label', 'Location: Arvada, Colorado, Within 10 km');`);
+  await verifyPicks('Changing the search radius on an open item should update its recommendations.',
+    { 'pick-near': ['≈ 15.8 km', 'yellow'] }, ['pick-distant', ...hiddenPicks]);
+
+  await browser.send('browsingContext.navigate', { context: peer, url: `${url}?peer`, wait: 'complete' });
+  await readPeer(`document.querySelector('#location').setAttribute('aria-label', 'Location: Arvada, Colorado, Within 10 km');`);
+  await verifyCards('The feed should use the narrow search radius before opening an item.',
+    { broomfield: ['≈ 15.8 km', 'yellow'] }, defaultHidden, readPeer);
+  await readPeer(`
+    (() => {
+      const dialog = document.createElement('section');
+      dialog.setAttribute('role', 'dialog');
+      dialog.setAttribute('aria-label', 'Change location');
+      dialog.innerHTML = '<input aria-label="Location" value="Arvada, Colorado">'
+        + '<label role="combobox">Radius130 kilometers</label><button aria-label="Apply">Apply</button>';
+      document.body.append(dialog);
+      const apply = dialog.querySelector('button');
+      apply.addEventListener('click', () => {
+        const detail = new DOMParser().parseFromString(${JSON.stringify(localItemFixture())}, 'text/html');
+        history.pushState({}, '', ${JSON.stringify(LOCAL_ITEM_PATH)});
+        document.head.append(detail.querySelector('[data-sjs]'));
+        document.body.replaceChildren(...detail.body.children);
+      });
+      apply.click();
+    })()
+  `);
+  await verifyPicks('Recommendations should use the newly applied radius and keep the feed search center.', distantPick, hiddenPicks);
+  await verifyLocalItem();
+
+  await readPeer(`
+    (() => {
+      const lateRoute = document.createElement('script');
+      lateRoute.type = 'application/json';
+      lateRoute.setAttribute('data-sjs', '');
+      lateRoute.textContent = JSON.stringify({ initialRouteInfo: { route: {
+        url: '/marketplace/',
+        rootView: { props: { location: { latitude: 39.8338, longitude: -105.1503, radius: 10 } } },
+      } } });
+      document.head.append(lateRoute);
+      const latePick = document.querySelector('#pick-distant').cloneNode(true);
+      latePick.id = 'pick-late';
+      latePick.querySelector('[data-vm-marketplace-distance]').remove();
+      latePick.querySelector('a').setAttribute('href',
+        '/marketplace/item/107/?tracking=test&referral_story_type=top_picks&referral_code=marketplace_top_picks&ref=product_details#photo');
+      document.querySelector('#picks').append(latePick);
+    })()
+  `);
+  await verifyPicks('A late recommendation with reordered referral parameters should use the retained search area despite newly inserted feed route data.',
+    { ...distantPick, 'pick-late': distantPick['pick-distant'] }, hiddenPicks);
+  await readPeer(`document.querySelector('#pick-late a').setAttribute('href', '/marketplace/item/107/?ref=search');`);
+  await verifyPicks('Reusing a recommendation tile for an ordinary link should remove its old distance tag.', distantPick, hiddenPicks);
+  await readPeer(`document.querySelector('#pick-late').remove();`);
+
+  await open();
+  await form(`field('#hide-partners').click(); field('#save').click();`);
+  await closed();
+  await verifyPicks('Disabling partner hiding should preserve shipping and distance filtering.',
+    distantPick, ['pick-far', 'pick-shipped']);
+  await open();
+  await form(`field('#hide-distance').click(); field('#hide-shipping').click(); field('#save').click();`);
+  await closed();
+  await verifyPicks('Disabling hiding should restore all recommendations and keep their distance tags.',
+    { ...distantPick, 'pick-far': ['≈ 2,307.3 km', 'red'] }, []);
+  await open();
+  await form(`field('#restore').click(); field('#save').click();`);
+  await closed();
+  await verifyPicks('Restoring defaults should filter the recommendations again.', distantPick, hiddenPicks);
+  await readPeer(`history.pushState({}, '', '/marketplace/you/');`);
+  await verifyPicks('Leaving the item for an unrelated Marketplace page should clean up recommendation filters.', {}, []);
+  await verifyLocalItem();
+  await browser.send('browsingContext.navigate', { context: peer, url: `${url}?peer`, wait: 'complete' });
+  await verifyCards('The feed should start over with its original search area and default settings.', {}, defaultHidden, readPeer);
+  console.log('PASS item recommendations honor shipping, partner, and distance settings and retain the feed search area on navigation.');
+
   await open();
   assert.deepEqual(await readForm(), defaults);
   assert.equal(await form(`return field('#show-all-distances').labels[0].textContent.trim();`), 'Show distance within my radius');
@@ -917,18 +1058,23 @@ async function testFirefox(seedLive) {
   let code = localInstallCode(source, seedLive);
   let scriptRequests = 0;
   const unexpectedItemRequests = [];
+  const pages = new Map([
+    ['/marketplace/', fixture],
+    ['/marketplace/item/81/', poshmarkItemFixture],
+    [LOCAL_ITEM_PATH, localItemFixture],
+  ]);
   const server = createServer((request, response) => {
     const path = request.url.split('?')[0];
     if (request.url === `/${USER_SCRIPT}`) {
       scriptRequests++;
       response.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
       response.end(code);
-    } else if (path === '/marketplace/' || path === '/marketplace/item/81/') {
+    } else if (pages.has(path)) {
       response.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
         'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline'",
       });
-      response.end(path === '/marketplace/item/81/' ? poshmarkItemFixture() : fixture());
+      response.end(pages.get(path)());
     } else {
       if (path.startsWith('/marketplace/item/')) unexpectedItemRequests.push(path);
       response.writeHead(404).end();
