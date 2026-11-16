@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Facebook Marketplace Local Only
 // @namespace    marketplace-local-only
-// @version      0.8.8
-// @description  Color Marketplace distances and hide listings using configurable radius, shipping, and partner-listing rules.
+// @version      0.9.14
+// @description  Flag older Marketplace listings, color distances, and hide listings using configurable age, radius, shipping, and partner rules.
 // @license      MIT
 // @homepageURL  https://github.com/robertely/marketplace-local-only
 // @supportURL   https://github.com/robertely/marketplace-local-only/issues
@@ -74,8 +74,20 @@ SOFTWARE.
   ]);
   const BADGE_ATTRIBUTE = 'data-vm-marketplace-distance';
   const DISTANCE_BADGE = `[${BADGE_ATTRIBUTE}]`;
+  const AGE_ATTRIBUTE = 'data-vm-marketplace-age';
+  const AGE_BADGE = `[${AGE_ATTRIBUTE}]`;
+  const BADGE_LABEL = '[data-vm-marketplace-label]';
+  const TAG_GROUP_ATTRIBUTE = 'data-vm-marketplace-tags';
+  const TAG_GROUP = `[${TAG_GROUP_ATTRIBUTE}]`;
+  const TAG_VALUES_ATTRIBUTE = 'data-vm-marketplace-values';
+  const TAG_VALUES = `[${TAG_VALUES_ATTRIBUTE}]`;
+  const METADATA_ATTRIBUTE = 'data-vm-marketplace-metadata';
+  const METADATA = `[${METADATA_ATTRIBUTE}]`;
+  const PRICE_ATTRIBUTE = 'data-vm-marketplace-price';
+  const PRICE = `[${PRICE_ATTRIBUTE}]`;
+  const DATE_WINDOWS = { '1': 86400, '7': 604800, '30': 2592000 };
   const KM_PER_MILE = 1.609344;
-  const DISTANCE_FORMAT = new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 });
+  const TAG_FORMAT = new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 });
   const SETTINGS_KEY = 'settings';
   const SETTINGS_TITLE = 'Marketplace Local Only settings';
   const SETTINGS_COMMAND = 'marketplace-local-only-settings';
@@ -88,7 +100,11 @@ SOFTWARE.
     hideBeyond: 5,
     hideShipping: true,
     hidePartners: true,
+    showDistanceTags: true,
     showAllDistances: false,
+    showAgeWarnings: true,
+    hideAgeBeyond: 3,
+    ageBands: [{ cutoff: 1, color: 'yellow' }, { cutoff: 2, color: 'red' }],
   };
   const STATE_NAMES = {
     AL: 'alabama', AK: 'alaska', AZ: 'arizona', AR: 'arkansas', CA: 'california',
@@ -110,16 +126,19 @@ SOFTWARE.
   const MARKETPLACE_PATH = /^\/marketplace(?:[/?]|$)/;
   const SIDEBAR_LOCATION = '[role="button"][aria-label^="Location:"], button[aria-label^="Location:"]';
   const LOCATION_DIALOG = '[role="dialog"][aria-label="Change location"]';
-  const checkedRouteScripts = new WeakMap();
-  const checkedPartnerScripts = new WeakMap();
+  const pageScriptData = new WeakMap();
+  const listingCreationTimes = new Map();
+  let mountedCreationTimes = new Map();
   const partnerIds = new Set();
   const packedFeeds = new Set();
   const packingTargets = new Set();
   let hiddenTiles = new Set();
   let scanPending = false;
   let hasDistanceBadges = false;
+  let hasAgeBadges = false;
+  let ageTimer;
   let hiddenTileStyle;
-  let priceLineStyle;
+  let tagStyle;
   let packedFeedStyle;
   let area;
   let pendingArea;
@@ -141,12 +160,10 @@ SOFTWARE.
     return params.get('ref') === 'product_details' && params.get('referral_code') === 'marketplace_top_picks';
   }
 
-  function settingsError(value) {
-    if (!Array.isArray(value?.bands) || typeof value.hideShipping !== 'boolean') {
-      return 'Enter valid color and hiding settings.';
-    }
+  function colorBandsError(bands) {
+    if (!Array.isArray(bands)) return 'Enter valid color bands.';
     const cutoffs = new Set();
-    for (const band of value.bands) {
+    for (const band of bands) {
       if (!Number.isFinite(band?.cutoff) || band.cutoff < 1) return 'Each color cutoff must be at least 1×.';
       if (cutoffs.has(band.cutoff)) return 'Give each color band a different cutoff.';
       if (typeof band.color !== 'string'
@@ -155,14 +172,41 @@ SOFTWARE.
       }
       cutoffs.add(band.cutoff);
     }
+    return '';
+  }
+
+  function settingsError(value) {
+    if (typeof value?.hideShipping !== 'boolean') return 'Enter valid color and hiding settings.';
+    const bandError = colorBandsError(value.bands)
+      || (value.ageBands === undefined ? '' : colorBandsError(value.ageBands));
+    if (bandError) return bandError;
     if (value.hideBeyond !== null && (!Number.isFinite(value.hideBeyond) || value.hideBeyond <= 0)) {
       return 'Enter a hide cutoff greater than zero.';
+    }
+    if (value.showDistanceTags !== undefined && typeof value.showDistanceTags !== 'boolean') {
+      return 'Choose whether to show distance tags.';
+    }
+    if (value.showAgeWarnings !== undefined && typeof value.showAgeWarnings !== 'boolean') {
+      return 'Choose whether to show date tags.';
+    }
+    if (value.hideAgeBeyond !== undefined && value.hideAgeBeyond !== null
+      && (!Number.isFinite(value.hideAgeBeyond) || value.hideAgeBeyond <= 0)) {
+      return 'Enter an age hide cutoff greater than zero.';
     }
     return '';
   }
 
   function readSettings(value) {
-    const { bands, hideBeyond, hideShipping, hidePartners, hidePoshmark, showAllDistances } = settingsError(value) ? DEFAULT_SETTINGS : value;
+    // A missing or invalid new preference must not discard existing distance settings.
+    const showDistanceTags = typeof value?.showDistanceTags === 'boolean' ? value.showDistanceTags : DEFAULT_SETTINGS.showDistanceTags;
+    const showAgeWarnings = typeof value?.showAgeWarnings === 'boolean' ? value.showAgeWarnings
+      : value?.ageMode === 'off' ? false : DEFAULT_SETTINGS.showAgeWarnings;
+    // Preserve an explicit legacy Off or Hide choice when splitting warnings from hiding.
+    const legacyAgeCutoff = value?.ageMode === 'off' ? null : value?.ageMode === 'hide' ? 1 : DEFAULT_SETTINGS.hideAgeBeyond;
+    const hideAgeBeyond = value?.hideAgeBeyond === null
+      || (Number.isFinite(value?.hideAgeBeyond) && value.hideAgeBeyond > 0) ? value.hideAgeBeyond : legacyAgeCutoff;
+    const ageBands = colorBandsError(value?.ageBands) ? DEFAULT_SETTINGS.ageBands : value.ageBands;
+    const { bands, hideBeyond, hideShipping, hidePartners, hidePoshmark, showAllDistances } = settingsError(value && { ...value, showDistanceTags, showAgeWarnings, hideAgeBeyond, ageBands }) ? DEFAULT_SETTINGS : value;
     return {
       bands: bands.toSorted((a, b) => a.cutoff - b.cutoff),
       hideBeyond,
@@ -170,7 +214,11 @@ SOFTWARE.
       // Carry over the previous Poshmark switch when upgrading saved settings.
       hidePartners: typeof hidePartners === 'boolean' ? hidePartners
         : typeof hidePoshmark === 'boolean' ? hidePoshmark : DEFAULT_SETTINGS.hidePartners,
+      showDistanceTags,
       showAllDistances: showAllDistances === true,
+      showAgeWarnings,
+      hideAgeBeyond,
+      ageBands: ageBands.toSorted((a, b) => a.cutoff - b.cutoff),
     };
   }
 
@@ -212,10 +260,10 @@ SOFTWARE.
       fieldset { min-inline-size: 0; margin: 0; padding: .75rem; border: 1px solid GrayText; border-radius: .6rem; }
       legend { font-weight: 650; }
       .hint { font-size: .9rem; }
-      .band, .hide-cutoff, .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; }
-      .band { align-items: end; margin-block: .65rem; }
-      .band label:not([hidden]) { display: grid; gap: .2rem; font-size: .9rem; }
-      .hide-option { display: block; margin-block-end: .25rem; }
+      .band, .age-band, .hide-cutoff, .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; }
+      .band, .age-band { align-items: end; margin-block: .65rem; }
+      .band label:not([hidden]), .age-band label:not([hidden]) { display: grid; gap: .2rem; font-size: .9rem; }
+      .hide-option, .tag-option { display: block; margin-block-end: .25rem; }
       .hide-cutoff { margin-block-start: .45rem; }
       button, select, input { font: inherit; }
       button, select, input[type="number"] { min-block-size: 2rem; }
@@ -230,16 +278,23 @@ SOFTWARE.
     `);
     root.adoptedStyleSheets = [style];
     root.innerHTML = `
-      <dialog aria-labelledby="settings-title" aria-describedby="radius-help">
+      <dialog aria-labelledby="settings-title">
         <form novalidate>
           <h2 id="settings-title">${SETTINGS_TITLE}</h2>
-          <p id="radius-help" class="hint">Cutoffs follow your Marketplace radius. With a 10 mi radius, 1.5× is 15 mi.</p>
           <fieldset>
             <legend>Distance tags</legend>
+            <label class="tag-option"><input type="checkbox" id="show-distance-tags"> Show distance tags</label>
+            <label class="tag-option"><input type="checkbox" id="show-all-distances"> Show distance within my radius</label>
             <p class="hint">Color bands apply beyond your radius. The highest cutoff reached sets the color.</p>
-            <label><input type="checkbox" id="show-all-distances"> Show distance within my radius</label>
             <div id="bands"></div>
             <button type="button" id="add-band">Add color band</button>
+          </fieldset>
+          <fieldset>
+            <legend>Date listed tags</legend>
+            <label class="tag-option"><input type="checkbox" id="show-age-warnings" aria-describedby="age-help"> Show date tags</label>
+            <p id="age-help" class="hint">Uses creation age and your date filter. Unknown ages are skipped. Highest matching band sets the color.</p>
+            <div id="age-bands"></div>
+            <button type="button" id="add-age-band">Add age color band</button>
           </fieldset>
           <fieldset>
             <legend>Hide listings</legend>
@@ -248,8 +303,13 @@ SOFTWARE.
             <p id="partner-help" class="hint">Includes eBay, Poshmark, and other Marketplace partners.</p>
             <div class="hide-cutoff">
               <label><input type="checkbox" id="hide-distance"> Hide beyond</label>
-              <label><input type="number" id="hide-cutoff" step="0.1" aria-label="Hide cutoff in multiples of your radius"> × radius</label>
+              <label><input type="number" id="hide-cutoff" min="0.1" data-minimum="0" step="0.1" aria-label="Hide cutoff in multiples of your radius"> × radius</label>
             </div>
+            <div class="hide-cutoff">
+              <label><input type="checkbox" id="hide-age"> Hide older than</label>
+              <label><input type="number" id="hide-age-cutoff" min="0.1" data-minimum="0" step="0.1" aria-label="Age hide cutoff in multiples of your date window"> × date window</label>
+            </div>
+            <p class="hint">With Last 24 hours selected, 3× hides listings older than 3 days.</p>
           </fieldset>
           <p id="error" role="alert"></p>
           <div class="actions">
@@ -264,32 +324,48 @@ SOFTWARE.
     const form = root.querySelector('form');
     const bands = root.querySelector('#bands');
     const add = root.querySelector('#add-band');
+    const showDistanceTags = root.querySelector('#show-distance-tags');
     const showAllDistances = root.querySelector('#show-all-distances');
     const hideShipping = root.querySelector('#hide-shipping');
     const hidePartners = root.querySelector('#hide-partners');
     const hideDistance = root.querySelector('#hide-distance');
     const hideCutoff = root.querySelector('#hide-cutoff');
+    const showAgeWarnings = root.querySelector('#show-age-warnings');
+    const hideAge = root.querySelector('#hide-age');
+    const hideAgeCutoff = root.querySelector('#hide-age-cutoff');
+    const ageBands = root.querySelector('#age-bands');
+    const addAgeBand = root.querySelector('#add-age-band');
     const error = root.querySelector('#error');
+    const cutoffSelector = 'input[type="number"]';
+    let restoreAll = false;
 
     function alignCutoffStep(input) {
-      // A number input steps from its minimum or its value attribute. Align
-      // that base with the current value so a saved 1.25 steps up to 1.35.
-      if (!input.hasAttribute('min')) {
-        input.defaultValue = input.value;
-        return;
-      }
+      const minimum = Number(input.dataset.minimum ?? 1);
       const value = input.valueAsNumber;
-      const afterTenths = /\.\d(\d+)$/.exec(String(value))?.[1];
-      input.min = value >= 1 && afterTenths ? `1.0${afterTenths}` : '1';
+      // Align the minimum with the value's tenths so 1.25 steps to 1.35 and
+      // 0.055 to 0.155, while the down arrow always stops at a positive value.
+      const [coefficient, exponent = '0'] = String(value).split('e');
+      const decimals = (coefficient.split('.')[1]?.length ?? 0) - Number(exponent);
+      const afterTenths = decimals > 1
+        ? coefficient.replace('.', '').padStart(decimals + 1, '0').slice(-decimals).slice(1) : '';
+      input.min = value >= minimum && /[1-9]/.test(afterTenths)
+        ? `${minimum}.0${afterTenths}` : String(minimum || 0.1);
     }
 
-    function makeBand({ cutoff, color = 'yellow' } = {}) {
+    function commitCutoff(input) {
+      if (input.valueAsNumber < 0) {
+        input.value = String(Number(input.dataset.minimum ?? 1) || 0.1);
+        alignCutoffStep(input);
+      }
+    }
+
+    function makeBand({ cutoff, color = 'yellow' } = {}, age = false) {
       const row = document.createElement('div');
-      row.className = 'band';
+      row.className = age ? 'age-band' : 'band';
       row.setAttribute('role', 'group');
-      row.setAttribute('aria-label', 'Distance color band');
+      row.setAttribute('aria-label', age ? 'Age color band' : 'Distance color band');
       row.innerHTML = `
-        <label>Cutoff (× radius) <input class="cutoff" type="number" min="1" step="0.1"></label>
+        <label>Cutoff (× ${age ? 'date window' : 'radius'}) <input class="cutoff" type="number" min="1" step="0.1"></label>
         <label>Color <select class="preset">
           <option value="yellow">Yellow</option>
           <option value="red">Red</option>
@@ -312,58 +388,97 @@ SOFTWARE.
         const neighbor = row.nextElementSibling ?? row.previousElementSibling;
         row.remove();
         error.textContent = '';
-        (neighbor?.querySelector('.cutoff') ?? add).focus();
+        (neighbor?.querySelector('.cutoff') ?? (age ? addAgeBand : add)).focus();
       });
       return row;
     }
 
     function render(value) {
-      bands.replaceChildren(...value.bands.map(makeBand));
+      bands.replaceChildren(...value.bands.map(band => makeBand(band)));
+      ageBands.replaceChildren(...value.ageBands.map(band => makeBand(band, true)));
+      showDistanceTags.checked = value.showDistanceTags;
       showAllDistances.checked = value.showAllDistances;
+      showAllDistances.disabled = !showDistanceTags.checked;
       hideShipping.checked = value.hideShipping;
       hidePartners.checked = value.hidePartners;
       hideDistance.checked = value.hideBeyond !== null;
       hideCutoff.value = value.hideBeyond ?? DEFAULT_SETTINGS.hideBeyond;
       alignCutoffStep(hideCutoff);
       hideCutoff.disabled = !hideDistance.checked;
+      showAgeWarnings.checked = value.showAgeWarnings;
+      hideAge.checked = value.hideAgeBeyond !== null;
+      hideAgeCutoff.value = value.hideAgeBeyond ?? DEFAULT_SETTINGS.hideAgeBeyond;
+      alignCutoffStep(hideAgeCutoff);
+      hideAgeCutoff.disabled = !hideAge.checked;
       error.textContent = '';
     }
 
+    function readForm() {
+      const readBands = container => [...container.children].map(row => {
+        const preset = row.querySelector('.preset').value;
+        return {
+          cutoff: row.querySelector('.cutoff').valueAsNumber,
+          color: preset === 'custom' ? row.querySelector('.custom-color').value : preset,
+        };
+      });
+      return {
+        bands: readBands(bands),
+        ageBands: readBands(ageBands),
+        hideShipping: hideShipping.checked,
+        hidePartners: hidePartners.checked,
+        hideBeyond: hideDistance.checked ? hideCutoff.valueAsNumber : null,
+        showDistanceTags: showDistanceTags.checked,
+        showAllDistances: showAllDistances.checked,
+        showAgeWarnings: showAgeWarnings.checked,
+        hideAgeBeyond: hideAge.checked ? hideAgeCutoff.valueAsNumber : null,
+      };
+    }
+
     render(settings);
+    const openingValues = readSettings(readForm());
     add.addEventListener('click', () => {
       const row = makeBand();
       bands.append(row);
       row.querySelector('.cutoff').focus();
     });
+    addAgeBand.addEventListener('click', () => {
+      const row = makeBand({}, true);
+      ageBands.append(row);
+      row.querySelector('.cutoff').focus();
+    });
     hideDistance.addEventListener('change', () => { hideCutoff.disabled = !hideDistance.checked; });
-    root.querySelector('#restore').addEventListener('click', () => render(DEFAULT_SETTINGS));
+    hideAge.addEventListener('change', () => { hideAgeCutoff.disabled = !hideAge.checked; });
+    showDistanceTags.addEventListener('change', () => { showAllDistances.disabled = !showDistanceTags.checked; });
+    root.querySelector('#restore').addEventListener('click', () => {
+      restoreAll = true;
+      render(DEFAULT_SETTINGS);
+    });
     root.querySelector('#cancel').addEventListener('click', () => dialog.close());
     form.addEventListener('input', event => {
-      if (event.target.matches('input[type="number"]')) alignCutoffStep(event.target);
+      if (event.target.matches(cutoffSelector)) alignCutoffStep(event.target);
       error.textContent = '';
+    });
+    // Keep incomplete edits intact until the user leaves the cutoff or saves.
+    form.addEventListener('focusout', event => {
+      if (event.target.matches(cutoffSelector)) commitCutoff(event.target);
     });
     form.addEventListener('submit', async event => {
       event.preventDefault();
       if (form.inert) return;
-      const value = {
-        bands: [...bands.children].map(row => {
-          const preset = row.querySelector('.preset').value;
-          return {
-            cutoff: row.querySelector('.cutoff').valueAsNumber,
-            color: preset === 'custom' ? row.querySelector('.custom-color').value : preset,
-          };
-        }),
-        hideShipping: hideShipping.checked,
-        hidePartners: hidePartners.checked,
-        hideBeyond: hideDistance.checked ? hideCutoff.valueAsNumber : null,
-        showAllDistances: showAllDistances.checked,
-      };
+      for (const input of form.querySelectorAll(cutoffSelector)) commitCutoff(input);
+      const value = readForm();
       error.textContent = settingsError(value);
       if (error.textContent) return;
 
       form.inert = true;
       try {
-        await GM.setValue(SETTINGS_KEY, readSettings(value));
+        const saved = readSettings(GM_getValue(SETTINGS_KEY));
+        for (const [key, draft] of Object.entries(readSettings(value))) {
+          if (restoreAll || JSON.stringify(draft) !== JSON.stringify(openingValues[key])) {
+            saved[key] = draft;
+          }
+        }
+        await GM.setValue(SETTINGS_KEY, saved);
         settings = readSettings(GM_getValue(SETTINGS_KEY));
         scheduleScan();
         dialog.close();
@@ -438,19 +553,64 @@ SOFTWARE.
     return null;
   }
 
-  function readNewRouteArea() {
-    let latestArea = null;
+  function readPageData() {
+    const entries = [];
     for (const script of document.querySelectorAll('script[type="application/json"][data-sjs]')) {
       const source = script.textContent;
-      if (checkedRouteScripts.get(script) === source) continue;
-      checkedRouteScripts.set(script, source);
-      if (!source.includes('"initialRouteInfo"')) continue;
-
-      try {
-        latestArea = findRouteArea(JSON.parse(source)) ?? latestArea;
-      } catch {
-        // Facebook can insert incomplete page data during navigation.
+      let entry = pageScriptData.get(script);
+      if (!entry || entry.source !== source) {
+        // Share one parse across route, age, and partner rules. Keep only the
+        // extracted fields; this weak cache lives no longer than the page script.
+        entry = { source, ageRecords: [], creationTimes: new Map(), partners: new Map(), routeArea: null };
+        pageScriptData.set(script, entry);
+        if (/"(?:initialRouteInfo|creation_time|is_partner_listing|partner_type|partner_brand_name)"\s*:/.test(source)) {
+          try {
+            const data = JSON.parse(source);
+            if (source.includes('"initialRouteInfo"')) entry.routeArea = findRouteArea(data);
+            const pending = [data];
+            while (pending.length) {
+              const value = pending.pop();
+              if (!value || typeof value !== 'object') continue;
+              const listing = value.listing;
+              // Match the feed's listing record, never a comment, photo, or seller date.
+              if (listing?.__typename === 'GroupCommerceProductItem'
+                && typeof listing.id === 'string' && /^\d+$/.test(listing.id)
+                && Object.hasOwn(listing, 'creation_time')) {
+                const time = listing.creation_time;
+                if (Number.isSafeInteger(time) && time >= 1072915200) {
+                  entry.ageRecords.push([listing.id, time]);
+                }
+              }
+              if (typeof value.id === 'string' && /^\d+$/.test(value.id)) {
+                const provider = typeof value.partner_type === 'string' ? value.partner_type : '';
+                const brand = typeof value.partner_brand_name === 'string' ? value.partner_brand_name : '';
+                if (value.is_partner_listing === true || /^(?:poshmark|ebay)$/i.test(provider)
+                  || /^(?:poshmark|ebay)$/i.test(brand)) {
+                  entry.partners.set(value.id, true);
+                } else if (value.is_partner_listing === false) {
+                  entry.partners.set(value.id, false);
+                }
+              }
+              for (const child of Object.values(value)) {
+                if (child && typeof child === 'object') pending.push(child);
+              }
+            }
+          } catch {
+            // Facebook can insert incomplete page data during navigation.
+          }
+        }
       }
+      entries.push(entry);
+    }
+    return entries;
+  }
+
+  function readNewRouteArea(pageData) {
+    let latestArea = null;
+    for (const entry of pageData) {
+      if (entry.routeRead) continue;
+      entry.routeRead = true;
+      latestArea = entry.routeArea ?? latestArea;
     }
     return latestArea;
   }
@@ -470,12 +630,12 @@ SOFTWARE.
     pendingArea = { dialog, city: placeKey(name) ?? normalizePlace(name), ...radius };
   }
 
-  function readMarketplaceArea() {
+  function readMarketplaceArea(pageData) {
     area ??= {};
     const inFeed = isMarketplaceFeed();
     // Item-route coordinates can describe the seller. Use the search controls or
     // the last feed area there, and leave unrelated route data for the next feed.
-    const routeArea = inFeed ? readNewRouteArea() : null;
+    const routeArea = inFeed ? readNewRouteArea(pageData) : null;
     if (routeArea) Object.assign(area, routeArea);
 
     const sidebar = readSidebarArea();
@@ -521,7 +681,8 @@ SOFTWARE.
     const body = link.firstElementChild;
     if (!body || body.childElementCount < 2) return null;
 
-    const rows = Array.from(body.lastElementChild.children).filter(row => !row.matches(DISTANCE_BADGE));
+    const rows = Array.from(body.lastElementChild.children).filter(row => !row.matches(TAG_GROUP));
+    if (!rows.length) return null;
     let ships = false;
     let point;
     for (const row of rows.slice(2)) {
@@ -535,40 +696,77 @@ SOFTWARE.
     return { ships, priceRow: rows[0], distanceKm: point ? distanceInKm(center, point) : null };
   }
 
-  function collectPartnerIds(source, ids) {
-    if (!/"(?:is_partner_listing|partner_type|partner_brand_name)"\s*:/.test(source)) return;
-    let data;
-    try {
-      data = JSON.parse(source);
-    } catch {
-      return;
-    }
-    const pending = [data];
-    while (pending.length) {
-      const value = pending.pop();
-      if (!value || typeof value !== 'object') continue;
-      if (typeof value.id === 'string' && /^\d+$/.test(value.id)) {
-        const provider = typeof value.partner_type === 'string' ? value.partner_type : '';
-        const brand = typeof value.partner_brand_name === 'string' ? value.partner_brand_name : '';
-        if (value.is_partner_listing === true || /^(?:poshmark|ebay)$/i.test(provider)
-          || /^(?:poshmark|ebay)$/i.test(brand)) {
-          ids.add(value.id);
-        } else if (value.is_partner_listing === false) {
-          ids.delete(value.id);
-        }
-      }
-      for (const child of Object.values(value)) {
-        if (child && typeof child === 'object') pending.push(child);
-      }
-    }
+  function readDateWindow() {
+    if (!isMarketplaceFeed()) return null;
+    const days = new URL(location.href).searchParams.get('daysSinceListed');
+    return Object.hasOwn(DATE_WINDOWS, days) ? DATE_WINDOWS[days] : null;
   }
 
-  function readPartnerIds() {
-    for (const script of document.querySelectorAll('script[type="application/json"][data-sjs]')) {
-      const source = script.textContent;
-      if (checkedPartnerScripts.get(script) === source) continue;
-      checkedPartnerScripts.set(script, source);
-      collectPartnerIds(source, partnerIds);
+  function readCreationTimes(pageData, ids, now) {
+    const mounted = new Map();
+    for (const id of ids) {
+      const time = mountedCreationTimes.get(id) ?? listingCreationTimes.get(id);
+      if (time !== undefined) mounted.set(id, time);
+    }
+    for (const entry of pageData) {
+      if (entry.agesRead) continue;
+      entry.agesRead = true;
+      // Parsing may happen on a route with no date filter. Check future dates
+      // when age rules first use the payload, as with a fresh age-only scan.
+      for (const [id, time] of entry.ageRecords) {
+        if (time <= now) entry.creationTimes.set(id, time);
+      }
+      delete entry.ageRecords;
+      for (const [id, time] of entry.creationTimes) {
+        listingCreationTimes.delete(id);
+        listingCreationTimes.set(id, time);
+        if (ids.has(id)) mounted.set(id, time);
+      }
+      // Partial records cannot retract an already observed creation time.
+    }
+    // Bound history without forgetting cards still mounted, including hidden ones.
+    while (listingCreationTimes.size > 5000) listingCreationTimes.delete(listingCreationTimes.keys().next().value);
+    const missing = new Set([...ids].filter(id => !mounted.has(id)));
+    // Returning cards can outlive history while their original JSON remains.
+    // Visit cached records once, without reparsing or fetching listing pages.
+    for (let index = pageData.length - 1; index >= 0 && missing.size; index--) {
+      for (const [id, time] of pageData[index].creationTimes) {
+        if (missing.delete(id)) mounted.set(id, time);
+      }
+    }
+    mountedCreationTimes = mounted;
+  }
+
+  function showAge({ values }, ageSeconds, windowSeconds, color) {
+    let badge = values.querySelector(`:scope > ${AGE_BADGE}`);
+    if (!badge) badge = createBadge('clock');
+    if (badge.getAttribute(AGE_ATTRIBUTE) !== color) {
+      badge.setAttribute(AGE_ATTRIBUTE, color);
+      badge.style.color = COLOR_PRESETS[color] ?? color;
+    }
+    const hours = ageSeconds < 172800;
+    const age = TAG_FORMAT.format(ageSeconds / (hours ? 3600 : 86400));
+    const window = windowSeconds === 86400 ? '24-hour' : `${windowSeconds / 86400}-day`;
+    const text = `${age} ${hours ? 'h' : 'd'}`;
+    const description = `Created about ${age} ${hours ? 'hours' : 'days'} ago; older than your ${window} filter. Renewal time may differ.`;
+    if (badge.title !== description) {
+      badge.title = description;
+      badge.setAttribute('aria-label', description);
+    }
+    const label = badge.querySelector(BADGE_LABEL);
+    if (label.textContent !== text) label.textContent = text;
+    if (values.lastChild !== badge) values.append(badge);
+    return badge;
+  }
+
+  function readPartnerIds(pageData) {
+    for (const entry of pageData) {
+      if (entry.partnersRead) continue;
+      entry.partnersRead = true;
+      for (const [id, partner] of entry.partners) {
+        if (partner) partnerIds.add(id);
+        else partnerIds.delete(id);
+      }
     }
   }
 
@@ -589,7 +787,8 @@ SOFTWARE.
     if (link.querySelector('img[alt="Poshmark" i], img[alt="eBay" i], [role="img"][aria-label="Poshmark" i], [role="img"][aria-label="eBay" i]')) return true;
     if (/,\s*(?:(?:from|listed on|sold on) )?(?:poshmark|ebay),\s*listing \d+$/i.test(link.getAttribute('aria-label') ?? '')) return true;
     const rows = link.firstElementChild?.lastElementChild?.children ?? [];
-    return Array.from(rows).slice(2).some(row => PARTNER_LABEL.test(row.textContent.trim()));
+    return Array.from(rows).filter(row => !row.matches(TAG_GROUP)).slice(2)
+      .some(row => PARTNER_LABEL.test(row.textContent.trim()));
   }
 
   function isPartnerCheckout(link, verifiedPartner) {
@@ -660,50 +859,174 @@ SOFTWARE.
     return link;
   }
 
-  function showDistance({ priceRow, distanceKm }, { unit = 'mi' }, color) {
-    if (!priceLineStyle) {
-      priceLineStyle = new CSSStyleSheet();
-      priceLineStyle.replaceSync(`
-        :has(> ${DISTANCE_BADGE}) {
-          display: flex !important;
-          align-items: baseline !important;
-          column-gap: 6px;
-        }
-        ${DISTANCE_BADGE} { color-scheme: light dark; }
-        :root.__fb-light-mode ${DISTANCE_BADGE} { color-scheme: light; }
-        :root.__fb-dark-mode ${DISTANCE_BADGE} { color-scheme: dark; }
-      `);
-      document.adoptedStyleSheets = [...document.adoptedStyleSheets, priceLineStyle];
+  function createBadge(iconName) {
+    const badge = document.createElement('span');
+    badge.setAttribute('role', 'img');
+    const svgNamespace = 'http://www.w3.org/2000/svg';
+    const icon = document.createElementNS(svgNamespace, 'svg');
+    icon.setAttribute('data-vm-marketplace-icon', iconName);
+    icon.setAttribute('aria-hidden', 'true');
+    icon.setAttribute('focusable', 'false');
+    icon.setAttribute('viewBox', '0 0 24 24');
+    const shapes = iconName === 'map'
+      ? [['path', { d: 'M3 6L9 3L15 6L21 3V18L15 21L9 18L3 21Z M9 3V18 M15 6V21' }]]
+      : [['circle', { cx: 12, cy: 12, r: 9 }], ['path', { d: 'M12 7V12L15 14' }]];
+    for (const [name, attributes] of shapes) {
+      const shape = document.createElementNS(svgNamespace, name);
+      for (const [attribute, value] of Object.entries(attributes)) shape.setAttribute(attribute, value);
+      icon.append(shape);
     }
+    const label = document.createElement('span');
+    label.setAttribute('data-vm-marketplace-label', '');
+    badge.append(icon, label);
+    return badge;
+  }
 
-    let badge = priceRow.querySelector(`:scope > ${DISTANCE_BADGE}`);
-    const priceStyle = !badge || color === 'inherit'
-      ? getComputedStyle(priceRow.querySelector('span[dir="auto"]') ?? priceRow)
-      : null;
-    if (!badge) {
-      const { fontFamily, fontSize, fontWeight, lineHeight } = priceStyle;
-      badge = document.createElement('span');
-      badge.title = 'Approximate straight-line distance to the listed city';
-      Object.assign(badge.style, {
-        fontFamily, fontSize, fontWeight, lineHeight, marginInlineStart: 'auto',
-        textAlign: 'end', minWidth: '0', overflowWrap: 'anywhere',
-      });
+  function listingTags(priceRow) {
+    if (!tagStyle) {
+      tagStyle = new CSSStyleSheet();
+      tagStyle.replaceSync(`
+        ${METADATA}:has(> ${TAG_GROUP}) {
+          display: flex;
+          flex-flow: row wrap;
+          align-items: stretch;
+          column-gap: .5em;
+        }
+        ${METADATA} > ${PRICE}:has(+ ${TAG_GROUP}) {
+          flex: 0 1 max-content;
+          align-self: baseline;
+          inline-size: max-content;
+          min-inline-size: 0;
+          max-inline-size: 100%;
+        }
+        ${METADATA} > ${TAG_GROUP} ~ * {
+          flex: 0 0 100%;
+          min-inline-size: 0;
+          box-sizing: border-box;
+        }
+        ${TAG_GROUP} {
+          display: flex;
+          align-self: baseline;
+          flex: 0 1 max-content;
+          margin-inline-start: auto;
+          inline-size: max-content;
+          max-inline-size: 100%;
+          box-sizing: border-box;
+          min-inline-size: 0;
+        }
+        ${TAG_VALUES} {
+          display: flex;
+          flex-wrap: wrap;
+          justify-content: flex-end;
+          align-items: baseline;
+          gap: .15em .35em;
+          min-inline-size: 0;
+        }
+        ${DISTANCE_BADGE}, ${AGE_BADGE} {
+          display: inline-flex;
+          align-items: baseline;
+          gap: .25em;
+          flex: 0 1 max-content;
+          font-size: .9em;
+          font-weight: 600;
+          line-height: 1.2;
+          text-align: end;
+          min-inline-size: 0;
+          max-inline-size: 100%;
+          box-sizing: border-box;
+          /* Center the visible lettering without moving its baseline away from the price. */
+          padding: .05em .35em .11em;
+          border: 1px solid color-mix(in srgb, currentColor 45%, transparent);
+          border-radius: 999px;
+          background-color: color-mix(in srgb, currentColor 12%, transparent);
+          color-scheme: light dark;
+        }
+        ${TAG_VALUES} ${BADGE_LABEL} {
+          min-inline-size: 0;
+          overflow-wrap: anywhere;
+        }
+        ${TAG_VALUES} [data-vm-marketplace-icon] {
+          flex: none;
+          align-self: center;
+          transform: translateY(.03em);
+          inline-size: .9em;
+          block-size: .9em;
+          fill: none;
+          stroke: currentColor;
+          stroke-width: 1.8;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+        }
+        @supports (text-box: trim-both cap alphabetic) {
+          ${DISTANCE_BADGE}, ${AGE_BADGE} {
+            display: inline-block;
+            position: relative;
+            padding-block: .28em;
+            padding-inline-start: 1.5em;
+          }
+          ${TAG_VALUES} ${BADGE_LABEL} {
+            display: block;
+            text-box: trim-both cap alphabetic;
+          }
+          /* Keep the label's baseline while centering the icon against the visible lettering. */
+          ${TAG_VALUES} [data-vm-marketplace-icon] {
+            position: absolute;
+            inset-inline-start: .35em;
+            top: 50%;
+            transform: translateY(-50%);
+          }
+        }
+        :root.__fb-light-mode ${DISTANCE_BADGE}, :root.__fb-light-mode ${AGE_BADGE} { color-scheme: light; }
+        :root.__fb-dark-mode ${DISTANCE_BADGE}, :root.__fb-dark-mode ${AGE_BADGE} { color-scheme: dark; }
+      `);
+      document.adoptedStyleSheets = [...document.adoptedStyleSheets, tagStyle];
     }
+    const metadata = priceRow.parentElement;
+    metadata.toggleAttribute(METADATA_ATTRIBUTE, true);
+    priceRow.toggleAttribute(PRICE_ATTRIBUTE, true);
+    let group = metadata.querySelector(`:scope > ${TAG_GROUP}`);
+    if (!group) {
+      group = document.createElement('span');
+      group.setAttribute(TAG_GROUP_ATTRIBUTE, '');
+      const values = document.createElement('span');
+      values.setAttribute(TAG_VALUES_ATTRIBUTE, '');
+      group.append(values);
+    }
+    const priceStyle = getComputedStyle(priceRow.querySelector('span[dir="auto"]') ?? priceRow);
+    for (const property of ['fontFamily', 'fontSize', 'fontWeight', 'lineHeight']) {
+      if (group.style[property] !== priceStyle[property]) group.style[property] = priceStyle[property];
+    }
+    // Leave Facebook's price and discount nodes intact; flex wrapping makes room for both tags.
+    if (priceRow.nextElementSibling !== group) priceRow.after(group);
+    return { values: group.querySelector(TAG_VALUES), priceColor: priceStyle.color };
+  }
+
+  function showDistance({ values, priceColor }, distanceKm, { unit = 'mi' }, color) {
+    let badge = values.querySelector(`:scope > ${DISTANCE_BADGE}`);
+    if (!badge) badge = createBadge('map');
 
     const colorChanged = badge.getAttribute(BADGE_ATTRIBUTE) !== color;
     if (colorChanged) {
       badge.setAttribute(BADGE_ATTRIBUTE, color);
     }
     if (color === 'inherit') {
-      if (badge.style.color !== priceStyle.color) badge.style.color = priceStyle.color;
+      if (badge.style.color !== priceColor) badge.style.color = priceColor;
     } else if (colorChanged) {
       badge.style.color = COLOR_PRESETS[color] ?? color;
     }
 
     const distance = unit === 'mi' ? distanceKm / KM_PER_MILE : distanceKm;
-    const text = `≈ ${DISTANCE_FORMAT.format(distance)} ${unit}`;
-    if (badge.textContent !== text) badge.textContent = text;
-    if (priceRow.lastChild !== badge) priceRow.append(badge);
+    const amount = TAG_FORMAT.format(distance);
+    const text = `${amount} ${unit}`;
+    const unitName = unit === 'mi' ? 'mile' : 'kilometer';
+    const description = `Approximate straight-line distance: ${amount} ${unitName}${amount === '1' ? '' : 's'} to the listed city.`;
+    if (badge.title !== description) {
+      badge.title = description;
+      badge.setAttribute('aria-label', description);
+    }
+    const label = badge.querySelector(BADGE_LABEL);
+    if (label.textContent !== text) label.textContent = text;
+    if (values.firstChild !== badge) values.prepend(badge);
     return badge;
   }
 
@@ -818,19 +1141,35 @@ SOFTWARE.
     scanPending = false;
     const tilesToHide = new Set();
     const staleBadges = new Set(document.querySelectorAll(DISTANCE_BADGE));
+    const staleAgeBadges = new Set(document.querySelectorAll(AGE_BADGE));
     hasDistanceBadges = false;
+    hasAgeBadges = false;
+    clearTimeout(ageTimer);
+    const now = Date.now() / 1000;
+    const dateWindow = settings.showAgeWarnings || settings.hideAgeBeyond !== null ? readDateWindow() : null;
+    let refreshAges = false;
     const inFeed = isMarketplaceFeed();
     const itemId = ITEM_PATH.exec(location.pathname)?.[1];
     syncSettingsMenu(inFeed || Boolean(itemId));
+    const links = inFeed || itemId ? [...document.querySelectorAll(ITEM_LINK)] : [];
+    const pageData = inFeed || itemId ? readPageData() : [];
+    const ids = new Set(links.map(link => ITEM_PATH.exec(link.pathname)?.[1]).filter(Boolean));
+    if (dateWindow) {
+      readCreationTimes(pageData, ids, now);
+    } else {
+      for (const id of mountedCreationTimes.keys()) {
+        if (!ids.has(id)) mountedCreationTimes.delete(id);
+      }
+    }
 
     const filterPartners = settings.hidePartners && (inFeed || Boolean(itemId));
-    if (filterPartners) readPartnerIds();
+    if (filterPartners) readPartnerIds(pageData);
     const partnerItem = filterPartners && itemId ? findPartnerItem(itemId) : null;
     updatePartnerNotice(partnerItem);
     if (partnerItem) tilesToHide.add(partnerItem);
 
     if (inFeed || itemId) {
-      const marketplaceArea = readMarketplaceArea();
+      const marketplaceArea = readMarketplaceArea(pageData);
       if (marketplaceArea.radiusKm && !placesLoading) {
         placesLoading = true;
         loadPlaces().catch(error => console.warn('Marketplace Local Only could not load its city lookup.', error));
@@ -839,12 +1178,23 @@ SOFTWARE.
         ? marketplaceArea.center ?? places[marketplaceArea.city]
         : null;
 
-      for (const link of document.querySelectorAll(ITEM_LINK)) {
+      for (const link of links) {
         if (filterPartners && isPartnerCard(link)) {
           tilesToHide.add(findListingTile(link));
           continue;
         }
         if (!inFeed && !isItemRecommendation(link)) continue;
+        // Item recommendations can remain mounted during navigation back to a feed.
+        const created = dateWindow && !isItemRecommendation(link)
+          ? mountedCreationTimes.get(ITEM_PATH.exec(link.pathname)?.[1]) : undefined;
+        const ageSeconds = created === undefined ? null : now - created;
+        if (created !== undefined) refreshAges = true;
+        const tooOld = dateWindow !== null && ageSeconds !== null && ageSeconds > dateWindow;
+        if (dateWindow !== null && ageSeconds !== null && settings.hideAgeBeyond !== null
+          && ageSeconds / dateWindow > settings.hideAgeBeyond) {
+          tilesToHide.add(findListingTile(link));
+          continue;
+        }
         const listing = classifyListing(link, center);
         if (!listing) continue;
         const multiple = listing.distanceKm === null ? null : listing.distanceKm / marketplaceArea.radiusKm;
@@ -852,15 +1202,39 @@ SOFTWARE.
         if ((listing.ships && settings.hideShipping)
           || (multiple !== null && settings.hideBeyond !== null && multiple > settings.hideBeyond)) {
           tilesToHide.add(findListingTile(link));
-        } else if (multiple !== null && (outsideRadius || settings.showAllDistances)) {
-          const band = outsideRadius ? settings.bands.findLast(band => multiple >= band.cutoff) : undefined;
-          staleBadges.delete(showDistance(listing, marketplaceArea, band?.color ?? 'inherit'));
-          hasDistanceBadges = true;
+        } else {
+          const distanceTag = settings.showDistanceTags && multiple !== null && (outsideRadius || settings.showAllDistances);
+          const ageTag = tooOld && settings.showAgeWarnings;
+          const tags = distanceTag || ageTag ? listingTags(listing.priceRow) : null;
+          if (distanceTag) {
+            const band = outsideRadius ? settings.bands.findLast(band => multiple >= band.cutoff) : undefined;
+            staleBadges.delete(showDistance(tags, listing.distanceKm, marketplaceArea, band?.color ?? 'inherit'));
+            hasDistanceBadges = true;
+          }
+          if (ageTag) {
+            const band = settings.ageBands.findLast(band => ageSeconds / dateWindow >= band.cutoff);
+            staleAgeBadges.delete(showAge(tags, ageSeconds, dateWindow, band?.color ?? 'inherit'));
+            hasAgeBadges = true;
+          }
         }
       }
     }
 
     for (const badge of staleBadges) badge.remove();
+    for (const badge of staleAgeBadges) badge.remove();
+    for (const group of document.querySelectorAll(TAG_GROUP)) {
+      if (!group.querySelector(`${DISTANCE_BADGE}, ${AGE_BADGE}`)) group.remove();
+    }
+    for (const metadata of document.querySelectorAll(METADATA)) {
+      if (metadata.querySelector(`:scope > ${TAG_GROUP}`)) continue;
+      metadata.removeAttribute(METADATA_ATTRIBUTE);
+    }
+    for (const price of document.querySelectorAll(PRICE)) {
+      if (!price.parentElement.matches(METADATA) || !price.nextElementSibling?.matches(TAG_GROUP)) {
+        price.removeAttribute(PRICE_ATTRIBUTE);
+      }
+    }
+    if (refreshAges) ageTimer = setTimeout(scheduleScan, 60000);
 
     if (tilesToHide.size && !hiddenTileStyle) {
       hiddenTileStyle = new CSSStyleSheet();
@@ -879,7 +1253,7 @@ SOFTWARE.
 
   function scheduleScan() {
     if (scanPending || (!isMarketplaceFeed() && !ITEM_PATH.test(location.pathname) && settingsCommand === undefined
-      && hiddenTiles.size === 0 && packedFeeds.size === 0 && !hasDistanceBadges)) return;
+      && hiddenTiles.size === 0 && packedFeeds.size === 0 && !hasDistanceBadges && !hasAgeBadges)) return;
 
     scanPending = true;
     requestAnimationFrame(() => {

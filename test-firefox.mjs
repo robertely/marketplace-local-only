@@ -15,7 +15,11 @@ import { fileURLToPath } from 'node:url';
 const ADDON_ID = '{aecec67f-0d10-4fa7-b7c7-609a2db280cf}';
 const USER_SCRIPT = 'marketplace-local-only.user.js';
 const FIREFOX = '/usr/lib/firefox/firefox';
+const FIXTURE_DEVICE_SCALE = 1.153846;
 const LOCAL_ITEM_PATH = '/marketplace/item/92/';
+const AGE_FIXTURE_PATH = '/marketplace/search/';
+const AGE_NOW = Date.UTC(2026, 10, 16, 12);
+const DAY = 86400;
 
 function findViolentmonkey() {
   const config = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
@@ -117,13 +121,16 @@ async function connect(endpoint) {
   await once(socket, 'open', { signal: AbortSignal.timeout(5000) });
   let nextId = 0;
   const pending = new Map();
+  const subscribers = new Map();
   socket.addEventListener('message', event => {
     const reply = JSON.parse(event.data);
     pending.get(reply.id)?.(reply);
+    subscribers.get(reply.method)?.(reply.params);
   });
 
   return {
     close: () => socket.close(),
+    on: (event, listener) => subscribers.set(event, listener),
     async send(method, params = {}) {
       const id = ++nextId;
       const reply = await new Promise((resolveReply, reject) => {
@@ -140,6 +147,39 @@ async function connect(endpoint) {
   };
 }
 
+async function watchItemRequests(browser) {
+  const itemRequests = [];
+  const suiteNavigations = new Set();
+  const isItemUrl = url => /^\/marketplace\/item(?:\/|$)/.test(new URL(url).pathname);
+  const key = (context, navigation, url) => JSON.stringify([context, navigation, url]);
+  const event = 'network.beforeRequestSent';
+  browser.on(event, ({ context, navigation, request }) => {
+    if (isItemUrl(request.url)) itemRequests.push({ context, navigation, url: request.url });
+  });
+  await browser.send('session.subscribe', { events: [event] });
+  return {
+    ...browser,
+    async send(method, params) {
+      const result = await browser.send(method, params);
+      if ((method === 'browsingContext.navigate' || method === 'browsingContext.reload')
+        && result.navigation && isItemUrl(result.url)) {
+        suiteNavigations.add(key(params.context, result.navigation, result.url));
+      }
+      return result;
+    },
+    assertNoUnexpectedRequests() {
+      let observedNavigations = 0;
+      const unexpected = itemRequests.filter(({ context, navigation, url }) => {
+        if (!suiteNavigations.delete(key(context, navigation, url))) return true;
+        observedNavigations++;
+        return false;
+      });
+      assert.ok(observedNavigations, 'The network monitor should see the suite visit item detail pages.');
+      assert.deepEqual(unexpected, [], 'Filtering must not request listing detail pages.');
+    },
+  };
+}
+
 async function evaluate(browser, context, expression, awaitPromise = false) {
   const evaluation = await browser.send('script.evaluate', {
     target: { context }, expression, awaitPromise,
@@ -148,7 +188,19 @@ async function evaluate(browser, context, expression, awaitPromise = false) {
   return evaluation.result.value;
 }
 
-function fixture() {
+// Rendering work can be paused in a background tab. Inspect the tab the way a
+// user would: activate it before checking the displayed state.
+async function evaluateVisible(browser, context, expression) {
+  await browser.send('browsingContext.activate', { context });
+  return evaluate(browser, context, expression);
+}
+
+async function pressKeys(browser, context, keys) {
+  const actions = [...keys].flatMap(value => [{ type: 'keyDown', value }, { type: 'keyUp', value }]);
+  await browser.send('input.performActions', { context, actions: [{ type: 'key', id: 'keyboard', actions }] });
+}
+
+function fixture({ extraCards = [], extraHead = '', radius = 65 } = {}) {
   const cards = [
     ['arvada', 'Shipping container', 'Arvada, CO'],
     ['broomfield', 'Stereo camera', 'Broomfield, CO'],
@@ -157,11 +209,13 @@ function fixture() {
     ['shipped', 'Laptop', 'South Jordan, UT', 'Ships to you'],
     ['unknown', 'Bike', 'Location unavailable'],
     ['outside-label', 'Tools', 'Outside your search area'],
+    ...extraCards,
   ];
-  const location = { latitude: 39.8338, longitude: -105.1503, radius: 65 };
+  const location = { latitude: 39.8338, longitude: -105.1503, radius };
   const route = { url: '/marketplace/', rootView: { props: { location } } };
   return `<!doctype html><html lang="en" class="__fb-light-mode"><head><meta charset="utf-8"><title>Marketplace fixture</title>
     <script type="application/json" data-sjs>${JSON.stringify({ initialRouteInfo: { route } })}</script>
+    ${extraHead}
     <style>
       .price { color: #606770; }
       .price span[dir="auto"] { color: #050505; }
@@ -185,6 +239,52 @@ function fixture() {
       </div>`;
     }).join('')}
     </main></body></html>`;
+}
+
+function ageListing(id, creationTime, type = 'GroupCommerceProductItem') {
+  return { listing: { id, __typename: type, creation_time: creationTime } };
+}
+
+function ageFixture() {
+  const now = AGE_NOW / 1000;
+  const old = now - 31 * DAY;
+  const edges = [
+    ageListing('1', now - DAY - 1.4 * 3600),
+    ageListing('2', now - DAY),
+    ageListing('3', now - 7 * DAY - 1),
+    ageListing('4', now - 8 * DAY),
+    ageListing('5', now - 8 * DAY),
+    ageListing('7', now + DAY),
+    ageListing('8', now - 7 * DAY),
+    ageListing('9', now - 30 * DAY),
+    ageListing('10', now - 30 * DAY - 1),
+    ageListing('11', old, 'Photo'),
+    ageListing('12', String(old)),
+    ageListing('13', old * 1000),
+    { node: ageListing('14', old).listing },
+    ageListing('15', 0),
+    ageListing('16', 1_000_000_000),
+    ageListing('17', old - 0.5),
+    ageListing(18, old),
+    ageListing('20', now - 2 * DAY),
+    ageListing('21', now - 2 * DAY + 1),
+    ageListing('22', now - DAY - 1),
+    ageListing('23', now - 3 * DAY),
+    ageListing('24', now - 3 * DAY - 1),
+    ageListing('25', now - 99_360),
+    ageListing('26', now - 99_361),
+  ];
+  const extraCards = [
+    'seven-days', 'thirty-days', 'older-than-thirty', 'wrong-type', 'numeric-string',
+    'milliseconds', 'unrelated-date', 'zero-date', 'pre-facebook', 'fractional-date',
+    'numeric-id', 'late-date', 'two-days', 'under-two-days', 'over-one-day', 'three-days', 'over-three-days',
+    'at-fractional-cutoff', 'over-fractional-cutoff',
+  ].map(id => [id, 'Camera', 'Location unavailable']);
+  return fixture({
+    extraCards,
+    extraHead: `<script id="age-fixture-data" type="application/json" data-sjs>${JSON.stringify({ data: { edges } })}</script>`,
+    radius: 130,
+  });
 }
 
 function partnerTileFixture(id, badge = '') {
@@ -283,6 +383,15 @@ function localInstallCode(source, seedLive) {
   let metadata = source.slice(0, endOfMetadata).replace(/^\/\/ @(?:downloadURL|updateURL)\b[^\n]*\n/gm, '');
   if (!seedLive) {
     metadata = metadata.replace(/^\/\/ @match[^\n]*\n/gm, '') + '// @match        http://localhost/*\n';
+    // Keep the content-script clock stable except in the dedicated timer fixture.
+    const strict = "'use strict';";
+    assert.ok(source.indexOf(strict) > endOfMetadata);
+    source = source.replace(strict, `${strict}
+  const Date = class extends globalThis.Date {
+    static now() { return Number(document.documentElement.dataset.fixtureNow ?? ${AGE_NOW}); }
+  };
+  const setTimeout = (callback, ms, ...args) => globalThis.setTimeout(callback,
+    new URL(location.href).searchParams.has('fixture-fast-timer') ? Math.min(ms, 200) : ms, ...args);`);
   }
   // Prevent Violentmonkey from falling back to the temporary localhost install URL.
   return metadata + '// @downloadURL  none\n// @updateURL    none\n' + source.slice(endOfMetadata);
@@ -308,34 +417,102 @@ async function checkForScriptUpdate(browser, optionsUrl) {
   return JSON.parse(result);
 }
 
+function warningLayoutIsCorrect(card, expectedPlacement) {
+  const row = card.querySelector('.price');
+  const metadata = row.parentElement;
+  const groups = card.querySelectorAll('[data-vm-marketplace-tags]');
+  const distance = card.querySelector('[data-vm-marketplace-distance]');
+  const age = card.querySelector('[data-vm-marketplace-age]');
+  const styledMetadata = metadata.hasAttribute('data-vm-marketplace-metadata');
+  const styledPrice = row.hasAttribute('data-vm-marketplace-price');
+  if (getComputedStyle(row).display !== 'block') return false;
+  if (!distance && !age) return !expectedPlacement && groups.length === 0 && !styledMetadata && !styledPrice
+    && getComputedStyle(metadata).display === 'block';
+
+  const [group] = groups;
+  if (!styledMetadata || !styledPrice || groups.length !== 1 || row.nextElementSibling !== group) return false;
+  const [values] = group.children;
+  if (group.children.length !== 1 || !values.matches('[data-vm-marketplace-values]')
+    || group.textContent !== values.textContent) return false;
+
+  const badges = [distance, age].filter(Boolean);
+  if (values.children.length !== badges.length
+    || badges.some((badge, index) => values.children[index] !== badge)) return false;
+
+  const price = row.querySelector('span[dir="auto"]') ?? row;
+  const pillSize = 0.9 * parseFloat(getComputedStyle(price).fontSize);
+  const trimsText = CSS.supports('text-box', 'trim-both cap alphabetic');
+
+  const groupBox = group.getBoundingClientRect();
+  const metadataBox = metadata.getBoundingClientRect();
+  const rowBox = row.getBoundingClientRect();
+  const titleBox = group.nextElementSibling.getBoundingClientRect();
+  const inline = groupBox.left >= rowBox.right - 1 && groupBox.top < rowBox.bottom && rowBox.top < groupBox.bottom;
+  const below = groupBox.top >= rowBox.bottom - 1;
+  const placement = inline ? 'inline' : 'below';
+  const first = badges[0].getBoundingClientRect();
+  const last = badges[badges.length - 1].getBoundingClientRect();
+  const orderedInline = last.left >= first.right - 1 && last.top < first.bottom && first.top < last.bottom;
+  return (inline || below) && (!expectedPlacement || placement === expectedPlacement)
+    && groupBox.height > 0 && groupBox.bottom <= titleBox.top + 1 && groupBox.left >= metadataBox.left - 1
+    && Math.abs(groupBox.right - metadataBox.right) <= 1 && Math.abs(last.right - groupBox.right) <= 1
+    && badges.every(badge => {
+      const [icon, label] = badge.children;
+      const iconName = badge === distance ? 'map' : 'clock';
+      if (badge.children.length !== 2 || !icon.matches(`svg[data-vm-marketplace-icon="${iconName}"]`)
+        || icon.namespaceURI !== 'http://www.w3.org/2000/svg' || !icon.childElementCount
+        || icon.getAttribute('aria-hidden') !== 'true' || icon.getAttribute('focusable') !== 'false'
+        || !label.matches('span[data-vm-marketplace-label]') || badge.textContent !== label.textContent
+        || badge.getAttribute('role') !== 'img' || !badge.title
+        || badge.getAttribute('aria-label') !== badge.title) return false;
+
+      if (badge === distance) {
+        const [amount, unit] = label.textContent.split(' ');
+        const fullUnit = unit === 'mi' ? 'mile' : 'kilometer';
+        if (badge.title !== `Approximate straight-line distance: ${amount} ${fullUnit}${amount === '1' ? '' : 's'} to the listed city.`) {
+          return false;
+        }
+      }
+
+      const style = getComputedStyle(badge);
+      const borderPixels = parseFloat(style.borderTopWidth) * devicePixelRatio;
+      if (Math.abs(parseFloat(style.fontSize) - pillSize) >= 0.05 || !['block', 'flex', 'inline-flex'].includes(style.display)
+        || borderPixels < 0.95 || borderPixels > 1.2
+        || style.borderTopStyle !== 'solid' || style.borderTopLeftRadius !== '999px'
+        || style.backgroundColor === 'rgba(0, 0, 0, 0)' || style.borderTopColor === 'rgba(0, 0, 0, 0)') return false;
+
+      const box = badge.getBoundingClientRect();
+      const iconBox = icon.getBoundingClientRect();
+      const labelBox = label.getBoundingClientRect();
+      if (trimsText) {
+        const labelStyle = getComputedStyle(label);
+        if (labelStyle.textBoxTrim !== 'trim-both' || labelStyle.textBoxEdge !== 'cap alphabetic'
+          || Math.abs((labelBox.top + labelBox.bottom) - (box.top + box.bottom)) > 1) return false;
+      }
+      const range = document.createRange();
+      range.selectNodeContents(label);
+      return box.left >= groupBox.left - 1 && box.right <= groupBox.right + 1
+        && iconBox.width > 0 && iconBox.height > 0 && iconBox.left >= box.left - 1
+        && Math.abs((iconBox.top + iconBox.bottom) - (box.top + box.bottom)) <= 2
+        && labelBox.left >= iconBox.right - 1 && labelBox.right <= box.right + 1
+        && [...range.getClientRects()].every(rect => rect.left >= labelBox.left - 1 && rect.right <= labelBox.right + 1);
+    })
+    && (badges.length === 1 || orderedInline || (below && last.top >= first.bottom - 1));
+}
+
 async function checkFiltering(browser, origin, optionsUrl) {
   const { context } = await browser.send('browsingContext.create', { type: 'tab' });
   await browser.send('browsingContext.navigate', { context, url: `${origin}/marketplace/`, wait: 'complete' });
-  const run = expression => evaluate(browser, context, expression);
+  const run = expression => evaluateVisible(browser, context, expression);
   const verifyCards = (message, badges, hidden = ['shipped'], read = run, selector = '#feed > div') => waitFor(message, () => read(`
     (() => {
       const cards = [...document.querySelectorAll(${JSON.stringify(selector)})];
       if (!cards.length) return false;
       const hidden = cards.filter(card => getComputedStyle(card).display === 'none').map(card => card.id);
-      const ordinaryRows = cards.filter(card => !card.querySelector('[data-vm-marketplace-distance]'));
-      if (ordinaryRows.some(card => getComputedStyle(card.querySelector('.price')).display !== 'block')) return false;
       const badges = cards.flatMap(card => [...card.querySelectorAll('[data-vm-marketplace-distance]')].map(badge => {
         const row = card.querySelector('.price');
         const price = row.querySelector('span[dir="auto"]') ?? row;
         const style = getComputedStyle(badge);
-        const textBox = node => {
-          const range = document.createRange();
-          range.selectNodeContents(node);
-          return range.getBoundingClientRect();
-        };
-        const amountBox = textBox(badge.previousElementSibling ?? row.firstChild);
-        const badgeBox = badge.getBoundingClientRect();
-        const rowBox = row.getBoundingClientRect();
-        const priceText = textBox(price.firstChild);
-        const badgeText = textBox(badge.firstChild);
-        const rightAligned = badge.parentElement === row && row.lastElementChild === badge
-          && badgeBox.left >= amountBox.right - 1 && Math.abs(badgeBox.right - rowBox.right) <= 1
-          && Math.abs(priceText.top - badgeText.top) <= 1 && price.firstChild.textContent === '$50';
         const color = badge.getAttribute('data-vm-marketplace-distance');
         const dark = document.documentElement.classList.contains('__fb-dark-mode');
         const expectedColor = document.createElement('span');
@@ -344,11 +521,10 @@ async function checkFiltering(browser, origin, optionsUrl) {
           yellow: dark ? '#ffd34d' : '#805900',
           red: dark ? '#ff6b78' : '#b42332',
         }[color] ?? color;
-        return [card.id, badge.textContent, color, style.color === expectedColor.style.color, rightAligned,
-          style.fontSize === getComputedStyle(price).fontSize];
+        return [card.id, badge.textContent, color, style.color === expectedColor.style.color, price.textContent === '$50'];
       }));
       return JSON.stringify({ hidden, badges }) === ${JSON.stringify(JSON.stringify({
-        hidden, badges: Object.entries(badges).map(([id, [label, color]]) => [id, label, color, true, true, true]),
+        hidden, badges: Object.entries(badges).map(([id, [label, color]]) => [id, label, color, true, true]),
       }))};
     })()
   `));
@@ -372,11 +548,11 @@ async function checkFiltering(browser, origin, optionsUrl) {
   `);
   await changeRouteArea(130);
   await verifyCards('New route data should replace the cached 65 km radius with 130 km.', {
-    utah: ['≈ 364.4 mi', 'red'],
+    utah: ['364.4 mi', 'red'],
   }, ['pennsylvania', 'shipped']);
   await changeRouteArea(10, 'Broomfield, Colorado', 39.9539, -105.0509);
   await verifyCards('A new search center should survive the simultaneous sidebar city change.', {
-    arvada: ['≈ 9.8 mi', 'yellow'],
+    arvada: ['9.8 mi', 'yellow'],
   }, defaultHidden);
   await changeRouteArea(65);
   await verifyCards('The latest route should restore the original search area.', {}, defaultHidden);
@@ -397,7 +573,7 @@ async function checkFiltering(browser, origin, optionsUrl) {
   `);
   await completeRoute(130);
   await verifyCards('A repaired route script should refresh the cached radius.', {
-    utah: ['≈ 364.4 mi', 'red'],
+    utah: ['364.4 mi', 'red'],
   }, ['pennsylvania', 'shipped']);
   await completeRoute(65);
   await verifyCards('An edited route script should refresh the radius again.', {}, defaultHidden);
@@ -415,25 +591,25 @@ async function checkFiltering(browser, origin, optionsUrl) {
   await verifyCards('A listing exactly at the radius should have no badge.', {}, defaultHidden);
   await setRadius('9.8 mi');
   await verifyCards('A listing just outside the radius should have a yellow badge.', {
-    broomfield: ['≈ 9.8 mi', 'yellow'],
+    broomfield: ['9.8 mi', 'yellow'],
   }, defaultHidden);
   await run(`document.documentElement.className = '__fb-dark-mode'`);
-  await verifyCards('The yellow preset should adapt to the dark theme.', { broomfield: ['≈ 9.8 mi', 'yellow'] }, defaultHidden);
+  await verifyCards('The yellow preset should adapt to the dark theme.', { broomfield: ['9.8 mi', 'yellow'] }, defaultHidden);
   await run(`document.documentElement.className = '__fb-light-mode'`);
   await setRadius(`${broomfieldKm / 2} km`);
-  await verifyCards('Red starts at twice the radius.', { broomfield: ['≈ 15.8 km', 'red'] }, defaultHidden);
+  await verifyCards('Red starts at twice the radius.', { broomfield: ['15.8 km', 'red'] }, defaultHidden);
   await setRadius(`${broomfieldKm / 5} km`);
-  await verifyCards('A listing exactly at the hide cutoff should remain visible.', { broomfield: ['≈ 15.8 km', 'red'] }, defaultHidden);
+  await verifyCards('A listing exactly at the hide cutoff should remain visible.', { broomfield: ['15.8 km', 'red'] }, defaultHidden);
   await setRadius(`${broomfieldKm / 5 - 0.001} km`);
   await verifyCards('Listings beyond the hide cutoff should have neither a tile nor a badge.', {}, ['broomfield', ...defaultHidden]);
   console.log('PASS yellow just beyond the radius, red at 2×, and hiding beyond 5×.');
 
   const miles = {
-    utah: ['≈ 364.4 mi', 'red'], pennsylvania: ['≈ 1,433.7 mi', 'red'],
+    utah: ['364.4 mi', 'red'], pennsylvania: ['1,433.7 mi', 'red'],
   };
   const kilometers = {
-    broomfield: ['≈ 15.8 km', '#3669c7'],
-    utah: ['≈ 586.5 km', 'red'], pennsylvania: ['≈ 2,307.3 km', 'red'],
+    broomfield: ['15.8 km', '#3669c7'],
+    utah: ['586.5 km', 'red'], pennsylvania: ['2,307.3 km', 'red'],
   };
   await setRadius('7 mi');
   await checkSettingsMenu(browser, context, origin, optionsUrl, verifyCards, miles);
@@ -458,7 +634,7 @@ async function checkFiltering(browser, origin, optionsUrl) {
   await verifyCards('The radius and unit applied through the location dialog should update the badges.', kilometers);
   await setRadius('40 mi');
   await verifyCards('The wider Marketplace radius should remove the Broomfield badge after Apply.', miles);
-  console.log('PASS radius changes and distance units keep the badge aligned with the price.');
+  console.log('PASS radius changes and distance units keep warnings next to the native price when there is room.');
 
   await run(`
     const card = document.querySelector('#arvada').cloneNode(true);
@@ -486,20 +662,12 @@ async function checkFiltering(browser, origin, optionsUrl) {
   await checkPacking(run);
 }
 
-async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCards, miles) {
-  const url = `${origin}/marketplace/`;
-  const run = expression => evaluate(browser, context, expression);
-  const { context: options } = await browser.send('browsingContext.create', { type: 'tab' });
-  await browser.send('browsingContext.navigate', { context: options, url: optionsUrl, wait: 'complete' });
-  const { context: peer } = await browser.send('browsingContext.create', { type: 'tab' });
-  await browser.send('browsingContext.navigate', { context: peer, url: `${url}?peer`, wait: 'complete' });
-  const readPeer = expression => evaluate(browser, peer, expression);
-  const defaultHidden = ['utah', 'pennsylvania', 'shipped'];
-  await verifyCards('A second tab should start with the defaults.', {}, defaultHidden, readPeer);
-
+function settingsControls(browser, context, options) {
+  const run = expression => evaluateVisible(browser, context, expression);
   const dialogOpen = () => run(`Boolean(document.querySelector('#vm-marketplace-settings')?.shadowRoot.querySelector('dialog:modal'))`);
   const open = () => waitFor('The Violentmonkey settings command should open one modal.', async () => {
     if (await dialogOpen()) return true;
+    const url = await run('location.href');
     // Send the same command as the Violentmonkey popup, from its extension page.
     await evaluate(browser, options, `
       (async () => {
@@ -523,6 +691,20 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
     })()
   `);
   const closed = () => waitFor('The settings dialog should close.', async () => !await dialogOpen());
+  return { open, form, closed };
+}
+
+async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCards, miles) {
+  const url = `${origin}/marketplace/`;
+  const run = expression => evaluateVisible(browser, context, expression);
+  const { context: options } = await browser.send('browsingContext.create', { type: 'tab' });
+  await browser.send('browsingContext.navigate', { context: options, url: optionsUrl, wait: 'complete' });
+  const { context: peer } = await browser.send('browsingContext.create', { type: 'tab' });
+  await browser.send('browsingContext.navigate', { context: peer, url: `${url}?peer`, wait: 'complete' });
+  const readPeer = expression => evaluateVisible(browser, peer, expression);
+  const defaultHidden = ['utah', 'pennsylvania', 'shipped'];
+  await verifyCards('A second tab should start with the defaults.', {}, defaultHidden, readPeer);
+  const { open, form, closed } = settingsControls(browser, context, options);
   const readForm = async () => JSON.parse(await form(`
     return JSON.stringify({
       bands: [...field('#bands').children].map(row => [
@@ -533,15 +715,19 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
       hideBeyond: field('#hide-distance').checked ? field('#hide-cutoff').valueAsNumber : null,
       hideShipping: field('#hide-shipping').checked,
       hidePartners: field('#hide-partners').checked,
+      showDistanceTags: field('#show-distance-tags').checked,
       showAllDistances: field('#show-all-distances').checked,
+      showAgeWarnings: field('#show-age-warnings').checked,
+      hideAgeBeyond: field('#hide-age').checked ? field('#hide-age-cutoff').valueAsNumber : null,
     });
   `));
   const defaults = {
     bands: [[1, 'yellow'], [2, 'red']], hideBeyond: 5, hideShipping: true, hidePartners: true, showAllDistances: false,
+    showDistanceTags: true, showAgeWarnings: true, hideAgeBeyond: 3,
   };
 
   const itemUrl = `${origin}${LOCAL_ITEM_PATH}`;
-  const distantPick = { 'pick-distant': ['≈ 586.5 km', 'red'] };
+  const distantPick = { 'pick-distant': ['586.5 km', 'red'] };
   const hiddenPicks = ['pick-far', 'pick-shipped', 'pick-partner'];
   const verifyPicks = (message, badges, hidden) => verifyCards(message, badges, hidden, readPeer, '#picks > div');
   const verifyLocalItem = async () => assert.equal(await readPeer(`
@@ -571,12 +757,12 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
   await verifyLocalItem();
   await readPeer(`document.querySelector('aside button').setAttribute('aria-label', 'Location: Arvada, Colorado, Within 10 km');`);
   await verifyPicks('Changing the search radius on an open item should update its recommendations.',
-    { 'pick-near': ['≈ 15.8 km', 'yellow'] }, ['pick-distant', ...hiddenPicks]);
+    { 'pick-near': ['15.8 km', 'yellow'] }, ['pick-distant', ...hiddenPicks]);
 
   await browser.send('browsingContext.navigate', { context: peer, url: `${url}?peer`, wait: 'complete' });
   await readPeer(`document.querySelector('#location').setAttribute('aria-label', 'Location: Arvada, Colorado, Within 10 km');`);
   await verifyCards('The feed should use the narrow search radius before opening an item.',
-    { broomfield: ['≈ 15.8 km', 'yellow'] }, defaultHidden, readPeer);
+    { broomfield: ['15.8 km', 'yellow'] }, defaultHidden, readPeer);
   await readPeer(`
     (() => {
       const dialog = document.createElement('section');
@@ -631,7 +817,7 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
   await form(`field('#hide-distance').click(); field('#hide-shipping').click(); field('#save').click();`);
   await closed();
   await verifyPicks('Disabling hiding should restore all recommendations and keep their distance tags.',
-    { ...distantPick, 'pick-far': ['≈ 2,307.3 km', 'red'] }, []);
+    { ...distantPick, 'pick-far': ['2,307.3 km', 'red'] }, []);
   await open();
   await form(`field('#restore').click(); field('#save').click();`);
   await closed();
@@ -645,7 +831,19 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
 
   await open();
   assert.deepEqual(await readForm(), defaults);
+  assert.deepEqual(JSON.parse(await form(`
+    return JSON.stringify([...root.querySelectorAll('fieldset > legend')].map(legend => legend.textContent.trim()));
+  `)), ['Distance tags', 'Date listed tags', 'Hide listings']);
+  assert.equal(await form(`
+    const hides = field('#hide-age').closest('fieldset');
+    return ['#hide-shipping', '#hide-partners', '#hide-distance', '#hide-age-cutoff']
+      .every(selector => field(selector).closest('fieldset') === hides)
+      && field('#show-age-warnings').closest('fieldset') === field('#age-bands').closest('fieldset');
+  `), true);
   assert.equal(await form(`return field('#show-all-distances').labels[0].textContent.trim();`), 'Show distance within my radius');
+  assert.equal(await form(`return field('#show-distance-tags').labels[0].textContent.trim();`), 'Show distance tags');
+  assert.equal(await form(`return field('#show-age-warnings').labels[0].textContent.trim();`), 'Show date tags');
+  assert.equal(await form(`return !field('#radius-help') && !field('dialog').hasAttribute('aria-describedby');`), true);
   assert.equal(await form(`return field('#hide-partners').labels[0].textContent.trim();`), 'Hide partner listings');
   const steps = await form(`
     function stepFrom(input, value) {
@@ -661,20 +859,100 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
       stepFrom(field('.cutoff'), '1.25'),
       stepFrom(field('#hide-cutoff'), '5'),
       stepFrom(field('#hide-cutoff'), '0.055'),
+      stepFrom(field('.age-band .cutoff'), '1'),
+      stepFrom(field('.age-band .cutoff'), '1.25'),
+      stepFrom(field('#hide-age-cutoff'), '3'),
+      stepFrom(field('#hide-age-cutoff'), '3.25'),
+      stepFrom(field('#hide-age-cutoff'), '1e-3'),
     ]);
   `);
-  assert.deepEqual(JSON.parse(steps), [[1.1, 1], [1.35, 1.25], [5.1, 5], [0.155, 0.055]]);
+  assert.deepEqual(JSON.parse(steps), [
+    [1.1, 1], [1.35, 1.25], [5.1, 5], [0.155, 0.055], [1.1, 1], [1.35, 1.25], [3.1, 3], [3.35, 3.25], [0.101, 0.001],
+  ]);
+  const cutoffFloors = [['#bands .cutoff', 1], ['.age-band .cutoff', 1], ['#hide-cutoff', 0.1], ['#hide-age-cutoff', 0.1]];
+  const negativeEdits = await form(`
+    const selectors = ${JSON.stringify(cutoffFloors.map(([selector]) => selector))};
+    return JSON.stringify(selectors.map(selector => {
+      const input = field(selector);
+      input.focus();
+      input.value = '-0.055';
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, data: '-0.055', inputType: 'insertFromPaste' }));
+      const draft = input.value;
+      input.blur();
+      return [draft, input.valueAsNumber];
+    }));
+  `);
+  assert.deepEqual(JSON.parse(negativeEdits), cutoffFloors.map(([, minimum]) => ['-0.055', minimum]));
+  for (const [selector, minimum] of [...cutoffFloors, ['#hide-cutoff', 0.055], ['#hide-age-cutoff', 0.001]]) {
+    await form(`
+      const input = field(${JSON.stringify(selector)});
+      input.value = ${JSON.stringify(String(minimum))};
+      input.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      input.focus();
+    `);
+    await pressKeys(browser, context, '\uE015');
+    assert.equal(await form(`return field(${JSON.stringify(selector)}).valueAsNumber;`), minimum);
+  }
   await form(`field('#restore').click();`);
-  console.log('PASS both cutoff controls step by 0.1× from whole and fractional values.');
+  await form(`const cutoff = field('#hide-age-cutoff'); cutoff.value = ''; cutoff.focus();`);
+  await pressKeys(browser, context, '-0.055');
+  assert.equal(await form(`return field('#hide-age-cutoff').value;`), '-0.055');
+  // Clicking through script avoids focusout, exercising the save path on its own.
+  await form(`field('#save').click();`);
+  await closed();
+  await open();
+  assert.equal((await readForm()).hideAgeBeyond, 0.1);
+  await form(`field('#restore').click(); field('#save').click();`);
+  await closed();
+  await open();
+  console.log('PASS real typing preserves negatives until Save, blur clamps negative drafts, and cutoffs step by 0.1×.');
   await form(`field('.cutoff').value = '2'; field('#save').click();`);
   assert.match(await form(`return field('#error').textContent;`), /different cutoff/);
-  await form(`field('.cutoff').value = '1'; field('#hide-cutoff').value = '0'; field('#save').click();`);
+  await form(`
+    field('.cutoff').value = '1';
+    const cutoff = field('#hide-cutoff');
+    cutoff.value = '0';
+    cutoff.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    field('#save').click();
+  `);
+  assert.match(await form(`return field('#error').textContent;`), /greater than zero/);
+  await form(`
+    field('#hide-cutoff').value = '5';
+    const cutoff = field('#hide-age-cutoff');
+    cutoff.value = '';
+    cutoff.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    field('#save').click();
+  `);
   assert.match(await form(`return field('#error').textContent;`), /greater than zero/);
   await form(`field('#cancel').click();`);
   await closed();
   await verifyCards('Invalid edits and Cancel should leave the feed unchanged.', {
-    broomfield: ['≈ 9.8 mi', 'yellow'],
+    broomfield: ['9.8 mi', 'yellow'],
   }, defaultHidden);
+
+  const peerMenu = settingsControls(browser, peer, options);
+  await open();
+  await peerMenu.open();
+  await peerMenu.form(`field('#hide-shipping').click();`);
+  await form(`field('#show-all-distances').click(); field('#save').click();`);
+  await closed();
+  const atCenter = { arvada: ['0 mi', 'inherit'] };
+  await verifyCards('The first save should reach the tab with an open settings dialog.',
+    { ...atCenter, broomfield: ['9.8 mi', 'inherit'] }, defaultHidden, readPeer);
+  assert.equal(await peerMenu.form(`return field('#hide-shipping').checked;`), false);
+  await peerMenu.form(`field('#save').click();`);
+  await peerMenu.closed();
+  await browser.send('browsingContext.reload', { context: peer, wait: 'complete' });
+  await peerMenu.open();
+  assert.equal(await peerMenu.form(`return !field('#hide-shipping').checked && field('#show-all-distances').checked;`), true);
+  await peerMenu.form(`field('#cancel').click();`);
+  await peerMenu.closed();
+  await open();
+  await form(`field('#restore').click(); field('#save').click();`);
+  await closed();
+  await verifyCards('Saving defaults should restore the feed after the simultaneous edits.',
+    { broomfield: ['9.8 mi', 'yellow'] }, defaultHidden);
+  console.log('PASS stale settings dialogs preserve changes saved in another tab.');
 
   await open();
   await form(`
@@ -684,7 +962,6 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
     field('#save').click();
   `);
   await closed();
-  const atCenter = { arvada: ['≈ 0 mi', 'inherit'] };
   await verifyCards('Showing nearby distances should include the search center and respect the hide cutoff.',
     atCenter, ['broomfield', ...defaultHidden]);
 
@@ -704,9 +981,9 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
   `);
   await closed();
   const withShipping = { ...miles, shipped: miles.utah };
-  const withNearby = { ...atCenter, broomfield: ['≈ 9.8 mi', 'inherit'], ...withShipping };
+  const withNearby = { ...atCenter, broomfield: ['9.8 mi', 'inherit'], ...withShipping };
   await verifyCards('Saving should recolor the current badge and restore the eligible tiles.', {
-    ...atCenter, broomfield: ['≈ 9.8 mi', '#3669c7'], ...withShipping,
+    ...atCenter, broomfield: ['9.8 mi', '#3669c7'], ...withShipping,
   }, []);
   await verifyCards('Saving should add neutral distance badges to nearby listings in another tab.', withNearby, [], readPeer);
   await readPeer(`document.documentElement.className = '__fb-dark-mode'`);
@@ -720,7 +997,10 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
     hideBeyond: null,
     hideShipping: false,
     hidePartners: true,
+    showDistanceTags: true,
     showAllDistances: true,
+    showAgeWarnings: true,
+    hideAgeBeyond: 3,
   };
   assert.deepEqual(await readForm(), customized);
   await form(`field('#restore').click();`);
@@ -866,6 +1146,558 @@ async function checkSettingsMenu(browser, context, origin, optionsUrl, verifyCar
   console.log('PASS nearby distances default to off, match the native price color, and persist when enabled.');
   console.log('PASS the Violentmonkey menu, custom bands, validation, Cancel and Escape, persistence, and cross-tab updates.');
   console.log('PASS partner filtering hides marked cards and the direct item, preserves ordinary listings, and stays off after refresh.');
+}
+
+async function checkAgingAndCache(browser, url) {
+  const { context } = await browser.send('browsingContext.create', { type: 'tab' });
+  const run = expression => evaluateVisible(browser, context, expression);
+  const expect = (message, expression) => waitFor(message, () => run(expression));
+  const age = id => `document.querySelector('#${id} [data-vm-marketplace-age]')?.textContent`;
+  const hidden = id => `getComputedStyle(document.getElementById('${id}')).display === 'none'`;
+  const withoutDateFilter = new URL(url);
+  withoutDateFilter.searchParams.delete('daysSinceListed');
+  const setDateFilter = route => run(`history.replaceState({}, '', ${JSON.stringify(String(route))});`);
+
+  await browser.send('browsingContext.navigate', { context, url, wait: 'complete' });
+  await expect('The age cache test should start with a visible warning and a hidden old listing.',
+    `${age('arvada')} === '25.4 h' && ${age('three-days')} === '3 d' && ${hidden('over-three-days')}`);
+  await run(`
+    (() => {
+      const original = document.querySelector('#arvada');
+      original.remove();
+      original.querySelector('[data-vm-marketplace-tags]').remove();
+      window.detachedAgeCard = original;
+
+      const data = document.createElement('script');
+      data.type = 'application/json';
+      data.setAttribute('data-sjs', '');
+      data.textContent = JSON.stringify({ edges: Array.from({ length: 5001 }, (_, index) => ({
+        listing: { id: String(10000 + index), __typename: 'GroupCommerceProductItem', creation_time: ${(AGE_NOW / 1000) - 2 * DAY} },
+      })) });
+      document.head.append(data);
+
+      const last = document.querySelector('#broomfield').cloneNode(true);
+      last.id = 'latest-aged-listing';
+      last.querySelector('a').href = '/marketplace/item/15000/';
+      document.querySelector('#feed').append(last);
+    })()
+  `);
+  await expect('New age records should be processed without losing warnings or hiding for mounted cards.',
+    `${age('latest-aged-listing')} === '2 d' && ${age('three-days')} === '3 d' && ${hidden('over-three-days')}`);
+  await run(`document.querySelector('#feed').prepend(window.detachedAgeCard);`);
+  await expect('An older listing returning after cache eviction should recover its age from data still on the page.',
+    `${age('arvada')} === '25.4 h'`);
+  await run(`document.querySelector('#age-fixture-data').remove();`);
+  await setDateFilter(withoutDateFilter);
+  await expect('Turning off the date filter should clear the warning and restore the age-hidden listing.',
+    `!${age('three-days')} && !(${hidden('over-three-days')})`);
+  await setDateFilter(url);
+  await expect('Turning the date filter back on should still recognize mounted listings whose original data was removed.',
+    `${age('arvada')} === '25.4 h' && ${age('three-days')} === '3 d' && ${hidden('over-three-days')}`);
+  console.log('PASS age cache eviction preserves mounted results and recovers a returning listing.');
+
+  await browser.send('browsingContext.navigate', { context, url: String(withoutDateFilter), wait: 'complete' });
+  await expect('The feed should be scanned before its date filter is enabled.', hidden('shipped'));
+  await run(`document.documentElement.dataset.fixtureNow = '${AGE_NOW + 2 * DAY * 1000 + 1000}';`);
+  await setDateFilter(url);
+  await expect('An age record should be validated when the date filter first uses it.', `${age('outside-label')} === '24 h'`);
+
+  await browser.send('browsingContext.navigate', { context, url: `${url}&fixture-fast-timer`, wait: 'complete' });
+  await expect('The age timer test should start with both age boundaries exact.',
+    `${age('arvada')} === '25.4 h' && !${age('broomfield')} && !(${hidden('three-days')})`);
+  await evaluate(browser, context, `
+    (async () => {
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      // The clock input is outside the attributes observed by the userscript.
+      document.documentElement.dataset.fixtureNow = '${AGE_NOW + 1000}';
+    })()
+  `, true);
+  await expect('The timer alone should refresh tags and hiding as the listing ages cross their cutoffs.',
+    `${age('broomfield')} === '24 h' && ${hidden('three-days')}`);
+  console.log('PASS mounted listings cross tag and hide cutoffs automatically as time advances.');
+  await browser.send('browsingContext.close', { context });
+}
+
+async function checkListingAge(browser, origin, optionsUrl) {
+  const { context: options } = await browser.send('browsingContext.create', { type: 'tab' });
+  await browser.send('browsingContext.navigate', { context: options, url: optionsUrl, wait: 'complete' });
+  const legacy = {
+    bands: [{ cutoff: 1, color: 'yellow' }, { cutoff: 2, color: 'red' }],
+    hideBeyond: 6,
+    hideShipping: true,
+    hidePoshmark: true,
+    showAllDistances: false,
+  };
+  // Use the same value-store command as Violentmonkey's storage editor.
+  const storeSettings = settings => evaluate(browser, options, `
+    (async () => {
+      const send = (cmd, data) => browser.runtime.sendMessage({ cmd, data });
+      const script = await send('GetScript', { meta: {
+        name: 'Facebook Marketplace Local Only', namespace: 'marketplace-local-only',
+      } });
+      await send('SetValueStores', { [script.props.id]: { settings: ${JSON.stringify('o' + JSON.stringify(settings))} } });
+    })()
+  `, true);
+  await storeSettings(legacy);
+
+  const path = days => `${AGE_FIXTURE_PATH}?daysSinceListed=${days}`;
+  await checkAgingAndCache(browser, origin + path(1));
+  const { context } = await browser.send('browsingContext.create', { type: 'tab' });
+  const { context: peer } = await browser.send('browsingContext.create', { type: 'tab' });
+  await browser.send('browsingContext.navigate', { context, url: origin + path(1), wait: 'complete' });
+  await browser.send('browsingContext.navigate', { context: peer, url: origin + path(30) + '&peer', wait: 'complete' });
+  const run = expression => evaluateVisible(browser, context, expression);
+  const readPeer = expression => evaluateVisible(browser, peer, expression);
+  const { open, form, closed } = settingsControls(browser, context, options);
+  const readAgeControls = async () => JSON.parse(await form(`
+    return JSON.stringify([field('#show-age-warnings').checked,
+      field('#hide-age').checked ? field('#hide-age-cutoff').valueAsNumber : null]);
+  `));
+  const readBands = async selector => JSON.parse(await form(`
+    return JSON.stringify([...field(${JSON.stringify(selector)}).children].map(row => [
+      row.querySelector('.cutoff').valueAsNumber,
+      row.querySelector('.preset').value === 'custom'
+        ? row.querySelector('.custom-color').value : row.querySelector('.preset').value,
+    ]));
+  `));
+  const saveAgeControls = async (showWarnings, cutoff) => {
+    await open();
+    await form(`
+      const cutoff = ${JSON.stringify(cutoff)};
+      field('#show-age-warnings').checked = ${showWarnings};
+      const hide = field('#hide-age');
+      if (hide.checked !== (cutoff !== null)) hide.click();
+      if (cutoff !== null) field('#hide-age-cutoff').value = String(cutoff);
+      field('#save').click();
+    `);
+    await closed();
+  };
+  const replaceRoute = route => run(`history.replaceState({}, '', ${JSON.stringify(route)});`);
+  const defaultHidden = ['pennsylvania', 'shipped'];
+  const defaultBands = [[1, 'yellow'], [2, 'red']];
+  const labels = {
+    arvada: '25.4 h', utah: '7 d', 'seven-days': '7 d', 'thirty-days': '30 d', 'older-than-thirty': '30 d',
+    'late-date': '10.2 d', 'two-days': '2 d', 'under-two-days': '48 h', 'over-one-day': '24 h',
+    'three-days': '3 d', 'over-three-days': '3 d',
+    'at-fractional-cutoff': '27.6 h', 'over-fractional-cutoff': '27.6 h',
+  };
+  const redByWindow = {
+    '24h': ['utah', 'seven-days', 'thirty-days', 'older-than-thirty', 'two-days', 'three-days', 'over-three-days'],
+    '7d': ['thirty-days', 'older-than-thirty'],
+  };
+  const verify = (message, warnings, window, {
+    hidden = defaultHidden, distances = ['utah'], read = run, selector = '#feed > div', colors = {},
+  } = {}) => waitFor(message, () => read(`
+    (() => {
+      const cards = [...document.querySelectorAll(${JSON.stringify(selector)})];
+      if (!cards.length) return false;
+      const hidden = cards.filter(card => getComputedStyle(card).display === 'none').map(card => card.id);
+      const distances = cards.filter(card => card.querySelector('[data-vm-marketplace-distance]')).map(card => card.id);
+      const ages = cards.flatMap(card => [...card.querySelectorAll('[data-vm-marketplace-age]')].map(badge => {
+        const row = card.querySelector('.price');
+        const title = badge.title.match(/^Created about ([\\d.,]+) (hours|days) ago; older than your (24-hour|7-day|30-day) filter\\./);
+        const color = badge.getAttribute('data-vm-marketplace-age');
+        const dark = document.documentElement.classList.contains('__fb-dark-mode');
+        const expectedColor = document.createElement('span');
+        expectedColor.style.color = {
+          inherit: getComputedStyle(row.parentElement).color,
+          yellow: dark ? '#ffd34d' : '#805900',
+          red: dark ? '#ff6b78' : '#b42332',
+        }[color] ?? color;
+        const style = getComputedStyle(badge);
+        return [card.id, badge.textContent, title?.[3], color, style.color === expectedColor.style.color,
+          badge.title.includes('Renewal time may differ.')
+            && badge.textContent === title?.[1] + ' ' + title?.[2]?.[0]];
+      }));
+      return JSON.stringify({ hidden, distances, ages }) === ${JSON.stringify(JSON.stringify({
+        hidden, distances, ages: warnings.map(id => [id, labels[id], {
+          '24h': '24-hour', '7d': '7-day', '30d': '30-day',
+        }[window], colors[id] ?? (redByWindow[window]?.includes(id) ? 'red' : 'yellow'), true, true]),
+      }))};
+    })()
+  `));
+  const verifyLayout = (message, placements) => waitFor(message, () => run(`
+    (() => {
+      const checkLayout = ${warningLayoutIsCorrect};
+      return Object.entries(${JSON.stringify(placements)}).every(([id, placement]) =>
+        checkLayout(document.getElementById(id), placement));
+    })()
+  `));
+  const overDay = ['arvada', 'utah', 'seven-days', 'thirty-days', 'older-than-thirty',
+    'two-days', 'under-two-days', 'over-one-day', 'three-days', 'over-three-days',
+    'at-fractional-cutoff', 'over-fractional-cutoff'];
+  const overWeek = ['utah', 'thirty-days', 'older-than-thirty'];
+  const overMonth = ['older-than-thirty'];
+
+  const hiddenAtRelaxedCutoff = ['utah', ...defaultHidden, 'seven-days', 'thirty-days', 'older-than-thirty'];
+  const visibleAtRelaxedCutoff = overDay.filter(id => !hiddenAtRelaxedCutoff.includes(id));
+  await verify('The default 3× age cutoff should keep a listing at exactly 3 days and hide one second beyond it.',
+    visibleAtRelaxedCutoff.filter(id => id !== 'over-three-days'), '24h',
+    { hidden: [...hiddenAtRelaxedCutoff, 'over-three-days'], distances: [] });
+  await replaceRoute(path(7));
+  await verify('Changing to the 7-day window should scale hiding to 21 days and restore the distant warning.',
+    ['utah'], '7d', { hidden: [...defaultHidden, 'thirty-days', 'older-than-thirty'] });
+  await verify('The 30-day window should show the stale listing until the 90-day limit.',
+    overMonth, '30d', { read: readPeer });
+  await replaceRoute(path(1));
+  await open();
+  assert.deepEqual(await readAgeControls(), [true, 3]);
+  await form(`field('#cancel').click();`);
+  await closed();
+  await saveAgeControls(true, 3.1);
+  await verify('A fractional 3.1× age cutoff should restore the listing just over 3 days.',
+    visibleAtRelaxedCutoff, '24h', { hidden: hiddenAtRelaxedCutoff, distances: [] });
+  await readPeer(`history.replaceState({}, '', ${JSON.stringify(path(1) + '&peer')});`);
+  await verify('The fractional cutoff should update another open tab.',
+    visibleAtRelaxedCutoff, '24h', { hidden: hiddenAtRelaxedCutoff, distances: [], read: readPeer });
+  await browser.send('browsingContext.reload', { context, wait: 'complete' });
+  await verify('The fractional age cutoff should survive refresh.',
+    visibleAtRelaxedCutoff, '24h', { hidden: hiddenAtRelaxedCutoff, distances: [] });
+  await open();
+  assert.deepEqual(await readAgeControls(), [true, 3.1]);
+  await form(`field('#cancel').click();`);
+  await closed();
+  await saveAgeControls(true, 1.15);
+  await verify('The exact 1.15× limit should stay visible while the listing one second older is hidden.',
+    ['arvada', 'over-one-day', 'at-fractional-cutoff'], '24h', {
+      hidden: [...hiddenAtRelaxedCutoff, 'two-days', 'under-two-days', 'three-days', 'over-three-days', 'over-fractional-cutoff'],
+      distances: [],
+    });
+  await saveAgeControls(true, null);
+  await readPeer(`history.replaceState({}, '', ${JSON.stringify(path(30) + '&peer')});`);
+
+  await verify('Turning off age hiding should restore warnings for the older cards.', overDay, '24h');
+  await verifyLayout('Smaller warning pills should align with plain and nested prices.', { arvada: 'inline', utah: 'inline' });
+  await verify('At the 30-day boundary only an older local listing should get a warning.', overMonth, '30d', { read: readPeer });
+  const nativeTitle = await run(`document.querySelector('#utah .city').previousElementSibling.textContent`);
+  await run(`
+    document.querySelector('#utah .city').previousElementSibling.textContent = 'Poshmark';
+    document.querySelector('#unknown .city').textContent = 'Listed on eBay';
+  `);
+  await verify('Scanning again should keep the ordinary Poshmark title and both warnings while hiding the actual partner.',
+    overDay, '24h', { hidden: [...defaultHidden, 'unknown'] });
+  await run(`
+    document.querySelector('#utah .city').previousElementSibling.textContent = 'eBay';
+    document.querySelector('#unknown .city').textContent = 'Location unavailable';
+    document.querySelector('#outside-label .city').textContent = 'Listed on Poshmark';
+  `);
+  await verify('Scanning again should keep the ordinary eBay title and both warnings while hiding the actual partner.',
+    overDay, '24h', { hidden: [...defaultHidden, 'outside-label'] });
+  await run(`
+    document.querySelector('#utah .city').previousElementSibling.textContent = ${JSON.stringify(nativeTitle)};
+    document.querySelector('#outside-label .city').textContent = 'Outside your search area';
+  `);
+  const nativePrice = await run(`document.querySelector('#utah .price').innerHTML`);
+  await run(`
+    (() => {
+      const price = document.querySelector('#utah .price');
+      price.innerHTML = document.querySelector('#broomfield .price').innerHTML;
+      const [current, original] = price.querySelectorAll('span[dir="auto"]');
+      current.textContent = '$1,250';
+      original.textContent = '$1,500';
+      current.style.fontFamily = 'Helvetica, Arial, sans-serif';
+      original.style.fontFamily = current.style.fontFamily;
+    })()
+  `);
+  await waitFor('Both pills should inherit the native sale font while preserving the price, strikethrough and device scale.', () => run(`
+    (() => {
+      const tile = document.querySelector('#utah');
+      const [current, original] = tile.querySelectorAll('.price span[dir="auto"]');
+      const currentStyle = getComputedStyle(current);
+      const labels = tile.querySelectorAll('[data-vm-marketplace-label]');
+      return current.textContent === '$1,250' && original.textContent === '$1,500'
+        && currentStyle.fontSize === '17px' && currentStyle.fontFamily === 'Helvetica, Arial, sans-serif'
+        && Math.abs(devicePixelRatio - ${FIXTURE_DEVICE_SCALE}) < 0.001 && labels.length === 2
+        && [...labels].every(label => getComputedStyle(label).fontFamily === currentStyle.fontFamily)
+        && getComputedStyle(original.parentElement).textDecorationLine === 'line-through';
+    })()
+  `));
+  await verifyLayout('At 242px, both warnings should wrap below the native 17px sale price and crossed-out original.',
+    { utah: 'below' });
+  await run(`Object.assign(document.querySelector('#utah').style, { width: '350px', minWidth: '350px' });`);
+  await verifyLayout('At 350px, the smaller Helvetica warning pills should center their labels beside the intact sale price.',
+    { utah: 'inline' });
+  await run(`
+    Object.assign(document.querySelector('#utah').style, { width: '242px', minWidth: '242px' });
+    document.querySelector('#utah .price').innerHTML = ${JSON.stringify(nativePrice)};
+  `);
+  await verifyLayout('A short price should fit beside both warnings when the card returns to 242px.', { utah: 'inline' });
+  const savedMetadata = await run(`document.querySelector('#arvada a').firstElementChild.lastElementChild.innerHTML`);
+  await run(`
+    document.querySelector('#arvada a').firstElementChild.lastElementChild.replaceChildren();
+    document.querySelector('#over-one-day a').setAttribute('href', '/marketplace/item/2/');
+  `);
+  await waitFor('An incomplete older card must not stop cleanup of another reused card.', () => run(`
+    !document.querySelector('#over-one-day [data-vm-marketplace-tags]')
+      && document.querySelector('#utah [data-vm-marketplace-age]') !== null
+  `));
+  await run(`
+    document.querySelector('#arvada a').firstElementChild.lastElementChild.innerHTML = ${JSON.stringify(savedMetadata)};
+    document.querySelector('#over-one-day a').setAttribute('href', '/marketplace/item/22/');
+  `);
+  await verify('Completing the card should restore its warning block without duplicates.', overDay, '24h');
+  await open();
+  assert.deepEqual(await readAgeControls(), [true, null]);
+  assert.deepEqual(await readBands('#age-bands'), defaultBands);
+  assert.equal(await form(`return field('#hide-cutoff').valueAsNumber;`), legacy.hideBeyond);
+  await form(`
+    field('.age-band .cutoff').value = '0.9';
+    field('#save').click();
+  `);
+  assert.match(await form(`return field('#error').textContent;`), /at least 1/);
+  await form(`
+    field('.age-band .cutoff').value = '2';
+    field('#hide-age').click();
+    field('#hide-age-cutoff').value = '1';
+    field('#hide-cutoff').value = '1';
+    field('#save').click();
+  `);
+  assert.match(await form(`return field('#error').textContent;`), /different cutoff/);
+  await verify('A duplicate age cutoff should reject changes to tags and hiding together.', overDay, '24h');
+  await form(`field('#cancel').click();`);
+  await closed();
+
+  await readPeer(`
+    history.replaceState({}, '', ${JSON.stringify(path(1) + '&peer')});
+    document.documentElement.className = '__fb-dark-mode';
+  `);
+  await verify('Default age tag colors should adapt to the dark theme.', overDay, '24h', { read: readPeer });
+  await open();
+  assert.deepEqual(await readAgeControls(), [true, null]);
+  assert.equal(await form(`return field('#hide-cutoff').valueAsNumber;`), legacy.hideBeyond);
+  assert.deepEqual(await readBands('#age-bands'), defaultBands);
+  await form(`
+    field('.age-band .cutoff').value = '1.1';
+    field('#add-age-band').click();
+    const row = field('#age-bands').lastElementChild;
+    row.querySelector('.cutoff').value = '1.25';
+    const preset = row.querySelector('.preset');
+    preset.value = 'custom';
+    preset.dispatchEvent(new Event('change', { bubbles: true }));
+    row.querySelector('.custom-color').value = '#3669c7';
+    field('#save').click();
+  `);
+  await closed();
+  const colors = { arvada: 'inherit', 'under-two-days': '#3669c7', 'over-one-day': 'inherit' };
+  await verify('A saved age band should use its custom color and inherit below the first cutoff.', overDay, '24h', { colors });
+  await verify('Saved age colors should update an open tab.', overDay, '24h', { colors, read: readPeer });
+  await browser.send('browsingContext.reload', { context, wait: 'complete' });
+  await verify('A custom age band should survive refresh.', overDay, '24h', { colors });
+  await open();
+  assert.deepEqual(await readBands('#age-bands'), [[1.1, 'yellow'], [1.25, '#3669c7'], [2, 'red']]);
+  assert.deepEqual(await readBands('#bands'), defaultBands);
+  await form(`field('#restore').click();`);
+  assert.deepEqual(await readBands('#age-bands'), defaultBands);
+  await form(`field('#cancel').click();`);
+  await closed();
+  await verify('Cancel should discard restored defaults and retain the saved colors.', overDay, '24h', { colors });
+
+  await open();
+  await form(`
+    for (const button of field('#age-bands').querySelectorAll('button')) button.click();
+    field('#save').click();
+  `);
+  await closed();
+  await run(`document.querySelector('#arvada .price').parentElement.style.color = '#5b4978';`);
+  const nativeColors = Object.fromEntries(overDay.map(id => [id, 'inherit']));
+  await verify('With empty age bands, every age tag should follow the native listing metadata color.',
+    overDay, '24h', { colors: nativeColors });
+  await verify('Clearing the age bands should also apply in the other tab.',
+    overDay, '24h', { colors: nativeColors, read: readPeer });
+  await browser.send('browsingContext.reload', { context, wait: 'complete' });
+  await verify('An empty age-band list should survive refresh.', overDay, '24h', { colors: nativeColors });
+  await open();
+  assert.deepEqual(await readBands('#age-bands'), []);
+  await form(`field('#restore').click(); field('#hide-age').click(); field('#save').click();`);
+  await closed();
+  await verify('Saving restored defaults should bring back the preset age colors.', overDay, '24h');
+  await verify('Restored age colors should apply in the other tab.', overDay, '24h', { read: readPeer });
+  await readPeer(`history.replaceState({}, '', ${JSON.stringify(path(30) + '&peer')});`);
+  console.log('PASS compact age tags, accessible descriptions, default and custom colors, validation, Cancel, Restore, persistence, and cross-tab changes.');
+
+  await replaceRoute(path(7));
+  await verify('The 7-day warning should update immediately and preserve the exact boundary.', overWeek, '7d');
+  await browser.send('browsingContext.activate', { context });
+  const lateOld = ageListing('19', AGE_NOW / 1000 - 10.2 * DAY);
+  await evaluate(browser, context, `
+    (async () => {
+      const data = document.createElement('script');
+      data.id = 'late-age-data';
+      data.type = 'application/json';
+      data.setAttribute('data-sjs', '');
+      data.textContent = '{"payload":';
+      document.head.append(data);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      data.firstChild.data = JSON.stringify({ payload: [${JSON.stringify(lateOld)}] });
+    })()
+  `, true);
+  await verify('Completing a late JSON script should warn for its matching card.', [...overWeek, 'late-date'], '7d');
+  await evaluate(browser, context, `
+    (async () => {
+      const partial = document.querySelector('#late-age-data').cloneNode(false);
+      partial.removeAttribute('id');
+      partial.textContent = JSON.stringify({ payload: ${JSON.stringify(ageListing('19', null))} });
+      document.head.append(partial);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    })()
+  `, true);
+  await verify('A partial record should preserve the last verified creation date.', [...overWeek, 'late-date'], '7d');
+  const recent = AGE_NOW / 1000 - DAY;
+  await run(`document.querySelector('#late-age-data').textContent =
+    JSON.stringify({ payload: ${JSON.stringify(ageListing('19', recent))} });`);
+  await verify('Editing an existing creation record should remove its obsolete warning.', overWeek, '7d');
+
+  await run(`document.querySelector('#older-than-thirty a').setAttribute('href', '/marketplace/item/19/');`);
+  await verify('A reused card must follow the new listing ID and remove the previous age warning.',
+    overWeek.slice(0, -1), '7d');
+  await run(`document.querySelector('#older-than-thirty a').setAttribute('href', '/marketplace/item/10/');`);
+  await verify('Returning to the old listing ID should restore one warning.', overWeek, '7d');
+  await run(`document.querySelector('#older-than-thirty a').setAttribute('href',
+    '/marketplace/item/10/?ref=product_details&referral_code=marketplace_top_picks');`);
+  await verify('A recommendation mounted in the feed should remain outside the age filter.', overWeek.slice(0, -1), '7d');
+  await run(`document.querySelector('#older-than-thirty a').setAttribute('href', '/marketplace/item/10/');`);
+  await verify('Changing the recommendation back to an ordinary feed card should restore its warning.', overWeek, '7d');
+  const itemPath = `${LOCAL_ITEM_PATH}?daysSinceListed=30`;
+  await replaceRoute(itemPath);
+  await verify('An item URL should clear age warnings from the previously mounted feed.',
+    [], null, { hidden: [], distances: [] });
+  await replaceRoute(path(7));
+  await verify('Returning from the item to the date-filtered feed should restore the warnings.', overWeek, '7d');
+  await replaceRoute(path('07'));
+  await verify('An unsupported window should remove warnings and keep distance and shipping filters.', []);
+  await replaceRoute(path(30));
+  await verify('An in-place route change should restore the correct 30-day warning.', overMonth, '30d');
+  console.log('PASS native age windows, exact cutoffs, unknown and invalid dates, late data, reused cards, and distance badge coexistence.');
+
+  const ageHidden = [...defaultHidden, ...overMonth];
+  await saveAgeControls(false, 1);
+  await verify('Age hiding should work independently when warnings are off.',
+    [], null, { hidden: ageHidden });
+  await verify('The independent age hiding preference should immediately update the other tab.',
+    [], null, { hidden: ageHidden, read: readPeer });
+  await browser.send('browsingContext.reload', { context, wait: 'complete' });
+  await verify('The age hiding preference should survive refresh.', [], null, { hidden: ageHidden });
+  await replaceRoute(AGE_FIXTURE_PATH);
+  await verify('Removing the age window should restore only the age-hidden listing.', []);
+  await replaceRoute(path(30));
+  await verify('Returning to the age window should restore age hiding.', [], null, { hidden: ageHidden });
+  await replaceRoute(itemPath);
+  await verify('Opening an item while the feed is mounted should clear age hiding.',
+    [], null, { hidden: [], distances: [] });
+  await browser.send('browsingContext.navigate', { context, url: `${origin}${LOCAL_ITEM_PATH}?daysSinceListed=1`, wait: 'complete' });
+  await evaluate(browser, context, `
+    (async () => {
+      const data = document.createElement('script');
+      data.type = 'application/json';
+      data.setAttribute('data-sjs', '');
+      data.textContent = ${JSON.stringify(JSON.stringify({ payload: [
+        ageListing('92', AGE_NOW / 1000 - 10 * DAY), ageListing('101', AGE_NOW / 1000 - 10 * DAY),
+      ] }))};
+      document.head.append(data);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    })()
+  `, true);
+  await verify('An item URL must never apply the feed age filter to recommendations.',
+    [], null, { hidden: ['pick-shipped', 'pick-partner'], distances: [], selector: '#picks > div' });
+  assert.equal(await run(`document.querySelector('#local-item').getClientRects().length > 0`), true);
+
+  await browser.send('browsingContext.navigate', { context, url: origin + path(30), wait: 'complete' });
+  await saveAgeControls(false, null);
+  await verify('Turning both age controls off should leave older listings visible without warnings.', []);
+  await verify('Turning off age hiding should restore the old listing in the other tab.', [], null, { read: readPeer });
+  await browser.send('browsingContext.reload', { context, wait: 'complete' });
+  await open();
+  assert.deepEqual(await readAgeControls(), [false, null]);
+  await form(`field('#restore').click();`);
+  assert.deepEqual(await readAgeControls(), [true, 3]);
+  await form(`field('#save').click();`);
+  await closed();
+  await verify('Saving restored defaults should warn in the live feed.', overMonth, '30d');
+  await verify('Saving restored defaults should warn in the other tab.', overMonth, '30d', { read: readPeer });
+
+  await replaceRoute(path(7));
+  await readPeer(`history.replaceState({}, '', ${JSON.stringify(path(7) + '&peer')});`);
+  const weekHidden = [...defaultHidden, 'thirty-days', ...overMonth];
+  const noDistanceTags = { hidden: weekHidden, distances: [] };
+  const readTagControls = async () => JSON.parse(await form(`
+    const nearby = field('#show-all-distances');
+    return JSON.stringify([field('#show-distance-tags').checked, field('#show-age-warnings').checked,
+      nearby.checked, nearby.disabled]);
+  `));
+  await verify('A distant old listing should show both kinds of tags by default.',
+    ['utah'], '7d', { hidden: weekHidden });
+  await open();
+  assert.deepEqual(await readTagControls(), [true, true, false, false]);
+  await form(`field('#show-all-distances').click(); field('#show-distance-tags').click();`);
+  assert.deepEqual(await readTagControls(), [false, true, true, true]);
+  await form(`field('#save').click();`);
+  await closed();
+  await verify('Turning off distance tags should preserve date tags and both hiding rules.',
+    ['utah'], '7d', noDistanceTags);
+  await verify('Turning off distance tags should update the other open tab.',
+    ['utah'], '7d', { ...noDistanceTags, read: readPeer });
+  await browser.send('browsingContext.reload', { context, wait: 'complete' });
+  await verify('Distance tags should stay off after refresh.', ['utah'], '7d', noDistanceTags);
+  await open();
+  assert.deepEqual(await readTagControls(), [false, true, true, true]);
+  await form(`field('#show-distance-tags').click(); field('#show-age-warnings').click();`);
+  assert.deepEqual(await readTagControls(), [true, false, true, false]);
+  await form(`field('#save').click();`);
+  await closed();
+  await verify('Turning off date tags should preserve distance tags and the saved nearby preference.',
+    [], null, { hidden: weekHidden, distances: ['arvada', 'broomfield', 'utah'] });
+  await open();
+  await form(`field('#show-distance-tags').click(); field('#save').click();`);
+  await closed();
+  await verify('Turning both tags off should clear their groups and price styles while leaving hiding rules active.',
+    [], null, noDistanceTags);
+  await verifyLayout('Turning both tags off should clear their groups and price styles.', { arvada: null, utah: null });
+  await verify('Turning both tags off should clear both groups in the other open tab.',
+    [], null, { ...noDistanceTags, read: readPeer });
+  await open();
+  await form(`field('#restore').click();`);
+  assert.deepEqual(await readTagControls(), [true, true, false, false]);
+  await form(`field('#cancel').click();`);
+  await closed();
+  await verify('Cancel should leave both saved tag controls off.', [], null, noDistanceTags);
+  await open();
+  assert.deepEqual(await readTagControls(), [false, false, true, true]);
+  await form(`field('#restore').click(); field('#save').click();`);
+  await closed();
+  await verify('Saving restored defaults should bring back both tags.',
+    ['utah'], '7d', { hidden: weekHidden });
+  console.log('PASS independent distance and date tags, hiding with both tags off, and saved nearby distances.');
+
+  const migrationBase = {
+    bands: [{ cutoff: 1.25, color: '#3669c7' }],
+    hideBeyond: 4.25,
+    hideShipping: false,
+    hidePartners: false,
+    showAllDistances: true,
+  };
+  const migrations = [
+    [{ ageMode: 'hide' }, [true, 1], true],
+    [{ ageMode: 'off', showAgeWarnings: true, hideAgeBeyond: -1, showDistanceTags: 'no' }, [true, null], true],
+    [{ ageMode: 'hide', showAgeWarnings: false, hideAgeBeyond: null, showDistanceTags: false }, [false, null], false],
+    [{ ageMode: 'off', showAgeWarnings: 'yes', hideAgeBeyond: 2.5 }, [false, 2.5], true],
+  ];
+  for (const [stored, expectedAge, expectedDistance] of migrations) {
+    await storeSettings({ ...migrationBase, ...stored, ageBands: [{ cutoff: 0.5, color: 'red' }] });
+    await browser.send('browsingContext.reload', { context, wait: 'complete' });
+    await open();
+    assert.deepEqual(await readBands('#age-bands'), defaultBands);
+    assert.deepEqual(await readBands('#bands'), [[1.25, '#3669c7']]);
+    assert.deepEqual(await readAgeControls(), expectedAge);
+    assert.equal(await form(`return field('#show-distance-tags').checked;`), expectedDistance);
+    assert.deepEqual(JSON.parse(await form(`return JSON.stringify([
+      field('#hide-cutoff').valueAsNumber, field('#hide-shipping').checked,
+      field('#hide-partners').checked, field('#show-all-distances').checked,
+    ]);`)), [4.25, false, false, true]);
+    await form(`field('#cancel').click();`);
+    await closed();
+  }
+  for (const tab of [context, peer, options]) await browser.send('browsingContext.close', { context: tab });
+  console.log('PASS independent age controls, default and fractional hiding, cross-tab updates, migration, and Restore.');
 }
 
 async function checkHidingOwnership(run) {
@@ -1057,9 +1889,9 @@ async function testFirefox(seedLive) {
   const source = await readFile(`/test/${USER_SCRIPT}`, 'utf8');
   let code = localInstallCode(source, seedLive);
   let scriptRequests = 0;
-  const unexpectedItemRequests = [];
   const pages = new Map([
     ['/marketplace/', fixture],
+    [AGE_FIXTURE_PATH, ageFixture],
     ['/marketplace/item/81/', poshmarkItemFixture],
     [LOCAL_ITEM_PATH, localItemFixture],
   ]);
@@ -1072,15 +1904,19 @@ async function testFirefox(seedLive) {
     } else if (pages.has(path)) {
       response.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
-        'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline'",
+        // Allow resource attempts to reach BiDi in the isolated network. Keep the
+        // page's script and style rules so fixture injection still exercises CSP.
+        'Content-Security-Policy': "script-src 'self'; style-src 'unsafe-inline'",
       });
       response.end(pages.get(path)());
     } else {
-      if (path.startsWith('/marketplace/item/')) unexpectedItemRequests.push(path);
       response.writeHead(404).end();
     }
   });
   const profile = seedLive ? '/profile' : await mkdtemp('/tmp/marketplace-firefox-');
+  if (!seedLive) {
+    writeFileSync(join(profile, 'user.js'), `user_pref("layout.css.devPixelsPerPx", "${FIXTURE_DEVICE_SCALE}");\n`);
+  }
   let firefox;
   let browser;
   try {
@@ -1127,8 +1963,11 @@ async function testFirefox(seedLive) {
       assert.equal(update.updates, 0);
       assert.equal(update.after, update.before);
       console.log('PASS Violentmonkey skips the temporary install URL during an update check.');
+      browser = await watchItemRequests(browser);
       await checkFiltering(browser, origin, optionsUrl);
-      assert.deepEqual(unexpectedItemRequests, [], 'Partner filtering must not request listing detail pages.');
+      await checkListingAge(browser, origin, optionsUrl);
+      browser.assertNoUnexpectedRequests();
+      console.log('PASS filtering never requests listing detail URLs.');
     }
   } finally {
     browser?.close();
